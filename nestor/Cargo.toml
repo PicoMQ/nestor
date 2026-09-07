@@ -1,0 +1,40 @@
+[package]
+name = "nestor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "A block-based read-through cache for object storage"
+repository.workspace = true
+
+[dependencies]
+foyer = { workspace = true }
+mixtrics = { workspace = true }
+serde = { workspace = true, optional = true }
+humantime-serde = { workspace = true, optional = true }
+
+ahash = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+pin-project-lite = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+metrics = { workspace = true }
+
+[features]
+serde = ["dep:serde", "dep:humantime-serde"]
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = { workspace = true }
+criterion = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+
+[[bench]]
+name = "read"
+harness = false
+
+[lints]
+workspace = true

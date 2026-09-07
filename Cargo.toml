@@ -1,0 +1,85 @@
+[workspace]
+resolver = "2"
+members = [
+    "nestor",
+    "nestor-store",
+    "nestor-s3",
+    "nestor-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "Apache-2.0"
+description = "A block-based read-through cache for object storage."
+repository = "https://github.com/nestor-cache/nestor"
+
+[workspace.dependencies]
+nestor = { path = "nestor" }
+nestor-store = { path = "nestor-store" }
+nestor-s3 = { path = "nestor-s3" }
+
+foyer = "0.22.5"
+mixtrics = "0.2.5"
+prometheus = { version = "0.14.0", default-features = false }
+object_store = "0.14.1"
+
+ahash = "0.8.12"
+async-trait = "0.1.92"
+bytes = "1.12.1"
+futures = "0.3.34"
+pin-project-lite = "0.2.17"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tracing = "0.1.44"
+metrics = "0.24.6"
+
+axum = { version = "0.8.9", default-features = false, features = ["http1", "http2", "tokio", "query", "matched-path"] }
+http = "1.5.0"
+http-body-util = "0.1.5"
+hyper = { version = "1.11.1", features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1.20", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
+hyper-rustls = { version = "0.27.9", default-features = false, features = ["http1", "http2", "tls12", "aws-lc-rs", "webpki-tokio", "native-tokio"] }
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false, features = ["http-listener"] }
+percent-encoding = "2.3.2"
+sha2 = "0.11.0"
+hmac = "0.13.0"
+hex = "0.4.3"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+quick-xml = "0.42.0"
+
+clap = { version = "4.6.6", features = ["derive", "env"] }
+axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+eyre = "0.6.14"
+figment = { version = "0.10.19", features = ["toml", "env"] }
+serde = { version = "1.0.229", features = ["derive"] }
+humantime-serde = "1.1.1"
+byte-unit = { version = "5.2.5", default-features = false, features = ["serde", "byte", "std"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+mimalloc = "0.1.52"
+
+proptest = "1.11.0"
+tempfile = "3.27.0"
+criterion = { version = "0.8.2", features = ["async_tokio"] }
+wiremock = "0.6.5"
+tower = { version = "0.5.2", features = ["util"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+return_self_not_must_use = "allow"
+redundant_closure_for_method_calls = "allow"
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"

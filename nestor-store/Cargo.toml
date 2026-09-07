@@ -1,0 +1,25 @@
+[package]
+name = "nestor-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "object_store integration for Nestor: use any ObjectStore as an origin, or expose Nestor as an ObjectStore"
+repository.workspace = true
+
+[dependencies]
+nestor = { workspace = true }
+
+object_store = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

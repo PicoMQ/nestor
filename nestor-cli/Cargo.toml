@@ -1,0 +1,39 @@
+[package]
+name = "nestor-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The nestor binary: an S3-compatible read-through cache in front of any S3 origin"
+repository.workspace = true
+
+[[bin]]
+name = "nestor"
+path = "src/main.rs"
+
+[dependencies]
+nestor = { workspace = true, features = ["serde"] }
+nestor-s3 = { workspace = true }
+
+axum = { workspace = true }
+axum-server = { workspace = true }
+byte-unit = { workspace = true }
+clap = { workspace = true }
+eyre = { workspace = true }
+figment = { workspace = true }
+http = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+mimalloc = { workspace = true }
+mixtrics = { workspace = true, features = ["prometheus"] }
+prometheus = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true, features = ["signal", "net"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+figment = { workspace = true, features = ["test"] }
+
+[lints]
+workspace = true

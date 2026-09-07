@@ -1,0 +1,50 @@
+# Every field is optional. Values shown are the defaults unless noted.
+# Any key can be set from the environment: NESTOR_CACHE__MEMORY='"2 GiB"'.
+
+[server]
+listen = "127.0.0.1:9000"
+# metrics = "127.0.0.1:9100"                          # Prometheus /metrics listener
+# tls = { cert = "/etc/nestor/tls.crt", key = "/etc/nestor/tls.key" }
+# addressing = { style = "virtual_hosted", domain = "s3.internal" }   # default is path style
+
+[origin]
+endpoint = "https://s3.us-east-1.amazonaws.com"      # any S3-compatible endpoint, such as http://minio:9000
+region = "us-east-1"
+virtual_hosted = false
+# source is "default" (env, profile, IMDS, IRSA), "anonymous" or "static"
+credentials = { source = "default" }
+# credentials = { source = "static", access_key = "...", secret_key = "..." }
+
+[auth]
+# Clients must sign with these credentials, SigV4 headers or presigned URLs.
+# "anonymous" accepts everything and is only safe on a loopback listener.
+mode = "anonymous"
+# mode = "static"
+# access_key = "..."
+# secret_key = "..."
+
+[cache]
+memory = "256 MiB"
+# shards = 64                 # default is 2 x cores, rounded up to a power of two
+meta_entries = 100000
+origin_concurrency = 64
+readahead_concurrency = 16
+hedge_concurrency = 16
+retry = { attempts = 3, base = "50ms", max = "2s" }
+
+# [cache.disk]
+# path = "/var/lib/nestor"
+# capacity = "8 GiB"
+# region_size = "64 MiB"
+# direct_io = true
+# compression = "none"        # none, lz4, zstd
+# recover = "quiet"           # none, quiet, strict
+
+[buckets]
+block_size = "1 MiB"          # power of two, 64 KiB to 16 MiB
+fetch_window = 8              # blocks per origin GET on a miss
+read_window = 16              # blocks in flight per stream
+consistency = { mode = "etag", ttl = "60s" }   # or { mode = "immutable" }
+readahead = 8                 # blocks prefetched on sequential access, 0 disables
+hedge = { factor = 3.0, min = "50ms", max = "2s" }
+populate_max = "16 MiB"       # PUT bodies up to this size are cached on the way through

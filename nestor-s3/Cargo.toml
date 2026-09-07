@@ -1,0 +1,42 @@
+[package]
+name = "nestor-s3"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "S3-compatible endpoint for Nestor: serves GET and HEAD from cache, forwards everything else to the origin"
+repository.workspace = true
+
+[dependencies]
+nestor = { workspace = true }
+nestor-store = { workspace = true }
+
+object_store = { workspace = true, features = ["aws"] }
+
+axum = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+hyper-rustls = { workspace = true }
+
+bytes = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+hmac = { workspace = true }
+percent-encoding = { workspace = true }
+pin-project-lite = { workspace = true }
+quick-xml = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "net"] }
+wiremock = { workspace = true }
+
+[lints]
+workspace = true
