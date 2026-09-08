@@ -15,6 +15,11 @@ use crate::key::{BlockKey, ObjectKey};
 
 pub type BlockCache = HybridCache<BlockKey, Bytes>;
 
+const MIB: usize = 1024 * 1024;
+/// Each RAM shard evicts on its own, so a shard has to hold a good number of blocks.
+const MIN_SHARD_BYTES: usize = 32 * MIB;
+const MAX_BUFFER_POOL: usize = 256 * MIB;
+
 #[derive(Debug, Clone)]
 pub struct DiskConfig {
     pub path: PathBuf,
@@ -22,7 +27,8 @@ pub struct DiskConfig {
     pub region_size: usize,
     pub flushers: usize,
     pub reclaimers: usize,
-    pub buffer_pool_size: usize,
+    /// Write buffer shared by the flushers, derived from capacity and region size when unset.
+    pub buffer_pool_size: Option<usize>,
     pub direct_io: bool,
     pub compression: Compression,
     pub recover: RecoverMode,
@@ -33,14 +39,22 @@ impl DiskConfig {
         Self {
             path: path.into(),
             capacity,
-            region_size: 64 * 1024 * 1024,
+            region_size: 64 * MIB,
             flushers: 2,
             reclaimers: 2,
-            buffer_pool_size: 256 * 1024 * 1024,
+            buffer_pool_size: None,
             direct_io: true,
             compression: Compression::None,
             recover: RecoverMode::Quiet,
         }
+    }
+
+    pub fn buffer_pool(&self) -> usize {
+        self.buffer_pool_size.unwrap_or_else(|| {
+            (self.capacity / 16)
+                .min(MAX_BUFFER_POOL)
+                .max(self.flushers * self.region_size)
+        })
     }
 }
 
@@ -55,7 +69,7 @@ impl CacheConfig {
     pub fn memory(memory: usize) -> Self {
         Self {
             memory,
-            shards: default_shards(),
+            shards: default_shards(memory),
             disk: None,
         }
     }
@@ -71,10 +85,10 @@ impl CacheConfig {
     }
 }
 
-fn default_shards() -> usize {
-    std::thread::available_parallelism()
-        .map_or(16, |n| n.get() * 2)
-        .next_power_of_two()
+/// Two shards per core for contention, capped so no shard falls under `MIN_SHARD_BYTES`.
+fn default_shards(memory: usize) -> usize {
+    let cores = std::thread::available_parallelism().map_or(8, |n| n.get());
+    (cores * 2).min(memory / MIN_SHARD_BYTES).max(1)
 }
 
 pub async fn build(
@@ -114,7 +128,7 @@ pub async fn build(
         .with_block_size(disk.region_size)
         .with_flushers(disk.flushers)
         .with_reclaimers(disk.reclaimers)
-        .with_buffer_pool_size(disk.buffer_pool_size)
+        .with_buffer_pool_size(disk.buffer_pool())
         .with_indexer_shards(config.shards.max(64));
 
     let storage = storage
@@ -143,4 +157,32 @@ pub(crate) fn object_lru<V: Send + Sync + 'static>(
         .with_eviction_config(LruConfig::default())
         .with_weighter(|_: &ObjectKey, _: &V| 1)
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CacheConfig, DiskConfig, MAX_BUFFER_POOL, MIB, MIN_SHARD_BYTES};
+
+    #[test]
+    fn shards_never_fall_under_the_minimum_size() {
+        assert_eq!(CacheConfig::memory(MIB).shards, 1);
+        let config = CacheConfig::memory(64 * MIN_SHARD_BYTES);
+        assert!(config.memory / config.shards >= MIN_SHARD_BYTES);
+        assert_eq!(CacheConfig::memory(MIB).shards(0).shards, 1);
+    }
+
+    #[test]
+    fn buffer_pool_follows_capacity_within_bounds() {
+        let mut small = DiskConfig::new("/tmp", 256 * MIB);
+        small.region_size = 16 * MIB;
+        assert_eq!(small.buffer_pool(), 2 * 16 * MIB);
+        assert_eq!(DiskConfig::new("/tmp", 4096 * MIB).buffer_pool(), 256 * MIB);
+        assert_eq!(
+            DiskConfig::new("/tmp", 64 * 1024 * MIB).buffer_pool(),
+            MAX_BUFFER_POOL
+        );
+        let mut pinned = DiskConfig::new("/tmp", 256 * MIB);
+        pinned.buffer_pool_size = Some(MIB);
+        assert_eq!(pinned.buffer_pool(), MIB);
+    }
 }

@@ -2,11 +2,9 @@
 //! against the next ranked node, and the block bodies are chained back in order.
 
 use std::future::Future;
-use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
 
-use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use nestor::{GetOptions, GetResponse, ObjectMeta, Origin, OriginError};
 
@@ -31,16 +29,13 @@ impl Cluster {
         }
 
         let first_index = block_size.index(start);
-        let first_range = start..limit.min(block_size.offset(first_index + 1));
+        let first_options = GetOptions {
+            range: Some(start..limit.min(block_size.offset(first_index + 1))),
+            if_match: options.if_match.clone(),
+            if_none_match: options.if_none_match,
+        };
         let first = self
-            .block(
-                bucket,
-                key,
-                object,
-                first_index,
-                first_range,
-                options.if_match.clone(),
-            )
+            .block(bucket, key, object, first_index, first_options)
             .await?;
         let end = limit.min(first.meta.size);
         let last_index = block_size.index(end.saturating_sub(1)).max(first_index);
@@ -54,13 +49,12 @@ impl Cluster {
                 let cluster = Arc::clone(&cluster);
                 let bucket = Arc::clone(&bucket);
                 let key = Arc::clone(&key);
-                let if_match = if_match.clone();
-                let range = block_size.block_range(index, Some(end));
-                async move {
-                    cluster
-                        .block(&bucket, &key, object, index, range, if_match)
-                        .await
-                }
+                let options = GetOptions {
+                    range: Some(block_size.block_range(index, Some(end))),
+                    if_match: if_match.clone(),
+                    if_none_match: None,
+                };
+                async move { cluster.block(&bucket, &key, object, index, options).await }
             })
             .buffered(self.config().read_window.max(1) as usize)
             .map_ok(|response| response.body)
@@ -97,8 +91,11 @@ impl Cluster {
         let object = object_hash(bucket, key);
         futures::stream::iter(0..block_size.count(size))
             .map(|index| {
-                let range = block_size.block_range(index, Some(size));
-                async move { self.block(bucket, key, object, index, range, None).await }
+                let options = GetOptions {
+                    range: Some(block_size.block_range(index, Some(size))),
+                    ..GetOptions::default()
+                };
+                async move { self.block(bucket, key, object, index, options).await }
             })
             .buffered(self.config().read_window.max(1) as usize)
             .try_for_each(|response| async move {
@@ -113,14 +110,9 @@ impl Cluster {
         key: &str,
         object: u64,
         index: u32,
-        range: Range<u64>,
-        if_match: Option<Bytes>,
+        options: GetOptions,
     ) -> Result<GetResponse, OriginError> {
         let ranked = self.rank(object, index);
-        let options = GetOptions {
-            range: Some(range),
-            if_match,
-        };
         self.hedged(&ranked, bucket, move |origin| {
             let options = options.clone();
             async move { origin.get(key, options).await }

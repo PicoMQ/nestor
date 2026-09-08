@@ -11,6 +11,8 @@ pub enum OriginError {
     NotFound,
     #[error("precondition failed")]
     PreconditionFailed,
+    #[error("not modified")]
+    NotModified,
     #[error("range not satisfiable")]
     InvalidRange,
     #[error("origin returned {got} bytes for a request of {expected}")]

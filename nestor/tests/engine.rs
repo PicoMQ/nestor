@@ -87,7 +87,7 @@ async fn large_read_coalesces_into_window_sized_gets() {
 }
 
 #[tokio::test]
-async fn full_and_suffix_ranges_resolve_via_head() {
+async fn full_range_learns_size_from_its_first_get() {
     let origin = Arc::new(MemoryOrigin::new());
     let data = pattern(3 * BLOCK as usize + 5);
     origin.put("obj", data.clone());
@@ -96,7 +96,8 @@ async fn full_and_suffix_ranges_resolve_via_head() {
     let full = nestor.get(id, "obj", ReadRange::Full).await.unwrap();
     assert_eq!(full.content_length(), Some(data.len() as u64));
     assert_eq!(full.collect().await.unwrap(), data);
-    assert_eq!(origin.heads(), 1);
+    assert_eq!(origin.heads(), 0);
+    assert_eq!(origin.gets(), 1);
 
     let tail = nestor.get(id, "obj", ReadRange::Suffix(10)).await.unwrap();
     assert_eq!(tail.collect().await.unwrap(), data.slice(data.len() - 10..));
@@ -108,7 +109,69 @@ async fn full_and_suffix_ranges_resolve_via_head() {
         from.collect().await.unwrap(),
         data.slice(2 * BLOCK as usize..)
     );
+    assert_eq!(origin.heads(), 0);
+    assert_eq!(origin.gets(), 1);
+}
+
+#[tokio::test]
+async fn suffix_on_an_unknown_object_needs_a_head() {
+    let origin = Arc::new(MemoryOrigin::new());
+    let data = pattern(BLOCK as usize + 5);
+    origin.put("obj", data.clone());
+    let (nestor, id) = engine(namespace(origin.clone(), Consistency::Immutable)).await;
+
+    let tail = nestor.get(id, "obj", ReadRange::Suffix(10)).await.unwrap();
+    assert_eq!(tail.collect().await.unwrap(), data.slice(data.len() - 10..));
     assert_eq!(origin.heads(), 1);
+}
+
+#[tokio::test]
+async fn expired_meta_revalidates_with_a_conditional_get() {
+    let origin = Arc::new(MemoryOrigin::new());
+    let data = pattern(2 * BLOCK as usize);
+    origin.put("obj", data.clone());
+    let ns = namespace(
+        origin.clone(),
+        Consistency::Etag {
+            ttl: Duration::from_millis(20),
+        },
+    );
+    let (nestor, id) = engine(ns).await;
+
+    assert_eq!(
+        nestor.read(id, "obj", 0..BLOCK).await.unwrap(),
+        data.slice(..BLOCK as usize)
+    );
+    let bytes = || {
+        origin
+            .stats()
+            .bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let fetched = bytes();
+    tokio::time::sleep(Duration::from_millis(40)).await;
+
+    assert_eq!(
+        nestor.read(id, "obj", 0..BLOCK).await.unwrap(),
+        data.slice(..BLOCK as usize)
+    );
+    assert_eq!(origin.gets(), 2, "one conditional GET to revalidate");
+    assert_eq!(bytes(), fetched, "an unchanged object moves no bytes");
+    assert_eq!(origin.heads(), 0);
+
+    let v2 = Bytes::from(vec![0xCD; 2 * BLOCK as usize]);
+    origin.put("obj", v2.clone());
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert_eq!(
+        nestor.read(id, "obj", 0..BLOCK).await.unwrap(),
+        v2.slice(..BLOCK as usize)
+    );
+    assert_eq!(
+        origin.gets(),
+        3,
+        "the revalidating GET carries the new version"
+    );
+    assert_eq!(origin.heads(), 0);
 }
 
 #[tokio::test]
@@ -218,7 +281,8 @@ async fn etag_mode_never_serves_stale_data() {
         nestor.read(id, "obj", 0..v1.len() as u64).await.unwrap(),
         v1
     );
-    assert_eq!(origin.heads(), 1);
+    assert_eq!(origin.heads(), 0);
+    assert_eq!(origin.gets(), 1);
 
     let v2 = Bytes::from(vec![0xAB; 2 * BLOCK as usize + 77]);
     origin.put("obj", v2.clone());
@@ -229,7 +293,8 @@ async fn etag_mode_never_serves_stale_data() {
     nestor.invalidate(id, "obj").unwrap();
     let fresh = nestor.read(id, "obj", 0..v2.len() as u64).await.unwrap();
     assert_eq!(fresh, v2);
-    assert_eq!(origin.heads(), 2);
+    assert_eq!(origin.heads(), 0);
+    assert_eq!(origin.gets(), 2);
 }
 
 #[tokio::test]
@@ -308,7 +373,6 @@ async fn hybrid_cache_survives_memory_pressure() {
     origin.put("obj", data.clone());
     let nestor = Nestor::builder(CacheConfig::memory(4 * BLOCK as usize).disk(DiskConfig {
         region_size: 4 * 1024 * 1024,
-        buffer_pool_size: 16 * 1024 * 1024,
         ..DiskConfig::new(dir.path(), 64 * 1024 * 1024)
     }))
     .namespace(namespace(origin.clone(), Consistency::Immutable))

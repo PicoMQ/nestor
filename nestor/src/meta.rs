@@ -1,5 +1,5 @@
 //! Object metadata cache. Entries record when they were fetched so namespaces with an `ETag` TTL can
-//! revalidate.
+//! revalidate, a stale entry keeps its `ETag` around for a conditional refresh.
 
 use std::time::{Duration, Instant};
 
@@ -13,6 +13,12 @@ pub(crate) struct MetaEntry {
     pub at: Instant,
 }
 
+pub(crate) enum MetaLookup {
+    Fresh(ObjectMeta),
+    Stale(ObjectMeta),
+    Missing,
+}
+
 pub(crate) struct MetaCache {
     cache: ObjectCache<MetaEntry>,
 }
@@ -24,15 +30,26 @@ impl MetaCache {
         }
     }
 
-    pub fn get(&self, key: &ObjectKey, ttl: Option<Duration>) -> Option<ObjectMeta> {
-        let entry = self.cache.get(key)?;
-        if let Some(ttl) = ttl
-            && entry.at.elapsed() > ttl
-        {
-            self.cache.remove(key);
-            return None;
+    pub fn lookup(&self, key: &ObjectKey, ttl: Option<Duration>) -> MetaLookup {
+        let Some(entry) = self.cache.get(key) else {
+            return MetaLookup::Missing;
+        };
+        match ttl {
+            Some(ttl) if entry.at.elapsed() > ttl => MetaLookup::Stale(entry.meta.clone()),
+            _ => MetaLookup::Fresh(entry.meta.clone()),
         }
-        Some(entry.meta.clone())
+    }
+
+    pub fn get(&self, key: &ObjectKey, ttl: Option<Duration>) -> Option<ObjectMeta> {
+        match self.lookup(key, ttl) {
+            MetaLookup::Fresh(meta) => Some(meta),
+            MetaLookup::Stale(_) | MetaLookup::Missing => None,
+        }
+    }
+
+    /// Size and `ETag` regardless of age, valid for a read that already pinned its tag.
+    pub fn any(&self, key: &ObjectKey) -> Option<ObjectMeta> {
+        self.cache.get(key).map(|entry| entry.meta.clone())
     }
 
     pub fn put(&self, key: ObjectKey, meta: ObjectMeta) {

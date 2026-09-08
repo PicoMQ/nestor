@@ -12,7 +12,7 @@ use futures::TryStreamExt;
 use http::header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, HeaderMap, HeaderValue};
 use http::request::Parts;
 use http::{Method, StatusCode};
-use nestor::{NamespaceId, Precondition, ReadRange};
+use nestor::{NamespaceId, NestorError, Precondition, ReadRange};
 use quick_xml::Reader;
 use quick_xml::escape::resolve_predefined_entity;
 use quick_xml::events::Event;
@@ -37,9 +37,13 @@ pub async fn handle(State(service): State<Arc<S3Service>>, req: Request) -> Resp
 }
 
 async fn dispatch(service: &S3Service, req: Request) -> Result<Response, S3Error> {
-    service
-        .auth
-        .verify(req.method(), req.uri(), req.headers(), Utc::now())?;
+    service.auth.verify(
+        req.method(),
+        req.uri(),
+        req.headers(),
+        Utc::now(),
+        &service.signing_keys,
+    )?;
     let host = crate::auth::host_of(req.headers(), req.uri());
     let target = service.addressing.resolve(&host, req.uri().path())?;
     let raw_query = req.uri().query().unwrap_or("").to_owned();
@@ -59,11 +63,27 @@ async fn serve(service: &S3Service, req: &Parts, target: &Target) -> Result<Resp
     let key = target.key.as_deref().expect("cacheable requires key");
     let ns = service.namespace(bucket)?;
     let nestor = &service.nestor;
+    let range = parse_range(&req.headers);
+    let partial = range.is_some();
+    let request = range.unwrap_or(ReadRange::Full);
 
-    let meta = nestor
-        .head(ns, key)
-        .await
-        .map_err(|e| S3Error::from_nestor(&e, key))?;
+    let (meta, stream) = if req.method == Method::HEAD {
+        let meta = nestor
+            .head(ns, key)
+            .await
+            .map_err(|e| S3Error::from_nestor(&e, key))?;
+        (meta, None)
+    } else {
+        let mut stream = match nestor.get(ns, key, request.clone()).await {
+            Ok(stream) => stream,
+            Err(e) => return read_failure(&e, key),
+        };
+        let meta = match stream.ready().await {
+            Ok(meta) => meta.clone(),
+            Err(e) => return read_failure(&e, key),
+        };
+        (meta, Some(stream))
+    };
 
     let mut response = Response::builder();
     let headers = response.headers_mut().expect("fresh builder");
@@ -84,41 +104,38 @@ async fn serve(service: &S3Service, req: &Parts, target: &Target) -> Result<Resp
         Precondition::Satisfied => {}
     }
 
-    let range = parse_range(&req.headers);
-    let partial = range.is_some();
-    let range = range.unwrap_or(ReadRange::Full);
-    let Ok(resolved) = range.resolve(meta.size) else {
-        let mut err = S3Error::invalid_range(key).into_response();
-        if let Ok(v) = HeaderValue::from_str(&format!("bytes */{}", meta.size)) {
-            err.headers_mut().insert(CONTENT_RANGE, v);
-        }
-        return Ok(err);
+    let Ok(resolved) = request.resolve(meta.size) else {
+        return Ok(unsatisfiable(key, meta.size));
     };
-
-    let headers = response.headers_mut().expect("fresh builder");
     content_headers(headers, &resolved, meta.size, partial);
     let status = if partial {
         StatusCode::PARTIAL_CONTENT
     } else {
         StatusCode::OK
     };
-
-    if req.method == Method::HEAD {
-        return response
-            .status(status)
-            .body(Body::empty())
-            .map_err(|e| S3Error::internal(e.to_string()));
-    }
-
-    let stream = nestor
-        .get(ns, key, ReadRange::Bounded(resolved))
-        .await
-        .map_err(|e| S3Error::from_nestor(&e, key))?;
-    let body = Body::from_stream(stream.map_err(std::io::Error::other));
+    let body = match stream {
+        Some(stream) => Body::from_stream(stream.map_err(std::io::Error::other)),
+        None => Body::empty(),
+    };
     response
         .status(status)
         .body(body)
         .map_err(|e| S3Error::internal(e.to_string()))
+}
+
+fn read_failure(e: &NestorError, key: &str) -> Result<Response, S3Error> {
+    match e {
+        NestorError::Range(_, size) => Ok(unsatisfiable(key, *size)),
+        other => Err(S3Error::from_nestor(other, key)),
+    }
+}
+
+fn unsatisfiable(key: &str, size: u64) -> Response {
+    let mut response = S3Error::invalid_range(key).into_response();
+    if let Ok(v) = HeaderValue::from_str(&format!("bytes */{size}")) {
+        response.headers_mut().insert(CONTENT_RANGE, v);
+    }
+    response
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

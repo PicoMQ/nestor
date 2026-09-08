@@ -1,12 +1,14 @@
 //! Signature Version 4 verification of incoming requests, both the header and presigned query forms.
 
+use std::borrow::Cow;
+
 use chrono::{DateTime, Duration, Utc};
 use http::{HeaderMap, Method, Uri};
 
 use crate::error::S3Error;
 use crate::sigv4::{
-    Authorization, Canonical, UNSIGNED_PAYLOAD, canonical_request, parse_amz_date, percent_decode,
-    scope, signature, signing_key, string_to_sign,
+    Authorization, Canonical, SigningKeys, UNSIGNED_PAYLOAD, canonical_request, parse_amz_date,
+    percent_decode, scope, signature, string_to_sign,
 };
 
 const MAX_SKEW_SECS: i64 = 15 * 60;
@@ -55,6 +57,7 @@ impl Auth {
         uri: &Uri,
         headers: &HeaderMap,
         now: DateTime<Utc>,
+        keys: &SigningKeys,
     ) -> Result<(), S3Error> {
         let Self::Static {
             access_key,
@@ -78,14 +81,17 @@ impl Auth {
                     .get("x-amz-date")
                     .or_else(|| headers.get(http::header::DATE))
                     .and_then(|v| v.to_str().ok())
-                    .ok_or_else(|| S3Error::invalid_request("missing x-amz-date"))?
-                    .to_owned();
+                    .ok_or_else(|| S3Error::invalid_request("missing x-amz-date"))?;
                 let payload_hash = headers
                     .get("x-amz-content-sha256")
                     .and_then(|v| v.to_str().ok())
-                    .ok_or_else(|| S3Error::invalid_request("missing x-amz-content-sha256"))?
-                    .to_owned();
-                (auth, amz_date, payload_hash, None)
+                    .ok_or_else(|| S3Error::invalid_request("missing x-amz-content-sha256"))?;
+                (
+                    auth,
+                    Cow::Borrowed(amz_date),
+                    Cow::Borrowed(payload_hash),
+                    None,
+                )
             } else if query_param(raw_query, "X-Amz-Algorithm").is_some() {
                 let credential = query_param(raw_query, "X-Amz-Credential")
                     .ok_or_else(|| S3Error::invalid_request("missing X-Amz-Credential"))?;
@@ -110,8 +116,8 @@ impl Auth {
                     .ok_or_else(|| S3Error::invalid_request("invalid X-Amz-Credential"))?;
                 (
                     auth,
-                    amz_date,
-                    UNSIGNED_PAYLOAD.to_owned(),
+                    Cow::Owned(amz_date),
+                    Cow::Borrowed(UNSIGNED_PAYLOAD),
                     Some("X-Amz-Signature"),
                 )
             } else {
@@ -143,7 +149,7 @@ impl Auth {
             skip_query,
         });
         let sts = string_to_sign(&amz_date, &scope(&auth.date, &auth.region), &canonical);
-        let key = signing_key(secret_key, &auth.date, &auth.region);
+        let key = keys.get(secret_key, &auth.date, &auth.region);
         let expected = signature(&key, &sts);
         if constant_time_eq(&expected, &auth.signature) {
             Ok(())
@@ -172,6 +178,10 @@ mod tests {
         parse_amz_date("20130524T000000Z").unwrap()
     }
 
+    fn keys() -> SigningKeys {
+        SigningKeys::default()
+    }
+
     fn signed_headers() -> HeaderMap {
         let mut h = HeaderMap::new();
         h.insert(HOST, "examplebucket.s3.amazonaws.com".parse().unwrap());
@@ -191,7 +201,7 @@ mod tests {
     fn accepts_aws_documented_request() {
         let uri: Uri = "/test.txt".parse().unwrap();
         auth()
-            .verify(&Method::GET, &uri, &signed_headers(), now())
+            .verify(&Method::GET, &uri, &signed_headers(), now(), &keys())
             .unwrap();
     }
 
@@ -200,23 +210,25 @@ mod tests {
         let uri: Uri = "/test.txt".parse().unwrap();
         let mut h = signed_headers();
         h.insert("range", "bytes=0-10".parse().unwrap());
-        let err = auth().verify(&Method::GET, &uri, &h, now()).unwrap_err();
+        let err = auth()
+            .verify(&Method::GET, &uri, &h, now(), &keys())
+            .unwrap_err();
         assert_eq!(err.code, "SignatureDoesNotMatch");
 
         let other: Uri = "/other.txt".parse().unwrap();
         let err = auth()
-            .verify(&Method::GET, &other, &signed_headers(), now())
+            .verify(&Method::GET, &other, &signed_headers(), now(), &keys())
             .unwrap_err();
         assert_eq!(err.code, "SignatureDoesNotMatch");
 
         let skewed = now() + Duration::hours(1);
         let err = auth()
-            .verify(&Method::GET, &uri, &signed_headers(), skewed)
+            .verify(&Method::GET, &uri, &signed_headers(), skewed, &keys())
             .unwrap_err();
         assert_eq!(err.code, "RequestTimeTooSkewed");
 
         let err = auth()
-            .verify(&Method::GET, &uri, &HeaderMap::new(), now())
+            .verify(&Method::GET, &uri, &HeaderMap::new(), now(), &keys())
             .unwrap_err();
         assert_eq!(err.code, "AccessDenied");
     }
@@ -226,9 +238,11 @@ mod tests {
         let uri: Uri = "/test.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20130524T000000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host&X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404".parse().unwrap();
         let mut h = HeaderMap::new();
         h.insert(HOST, "examplebucket.s3.amazonaws.com".parse().unwrap());
-        auth().verify(&Method::GET, &uri, &h, now()).unwrap();
+        auth()
+            .verify(&Method::GET, &uri, &h, now(), &keys())
+            .unwrap();
         let err = auth()
-            .verify(&Method::GET, &uri, &h, now() + Duration::days(2))
+            .verify(&Method::GET, &uri, &h, now() + Duration::days(2), &keys())
             .unwrap_err();
         assert_eq!(err.message, "Request has expired");
     }
@@ -237,7 +251,7 @@ mod tests {
     fn anonymous_mode_accepts_everything() {
         let uri: Uri = "/x".parse().unwrap();
         Auth::Anonymous
-            .verify(&Method::PUT, &uri, &HeaderMap::new(), now())
+            .verify(&Method::PUT, &uri, &HeaderMap::new(), now(), &keys())
             .unwrap();
     }
 }

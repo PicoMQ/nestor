@@ -17,10 +17,10 @@ use crate::block::group_misses;
 use crate::cache::BlockCache;
 use crate::error::{NestorError, OriginError};
 use crate::inflight::{Inflight, Registration, Slot, SlotHandle};
-use crate::key::{BlockKey, IMMUTABLE_TAG, ObjectKey, content_tag};
+use crate::key::{BlockKey, IMMUTABLE_TAG, ObjectKey, block_tag, content_tag};
 use crate::meta::MetaCache;
 use crate::namespace::NamespaceState;
-use crate::origin::{GetOptions, GetResponse};
+use crate::origin::{GetOptions, GetResponse, ObjectMeta};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(
@@ -142,7 +142,42 @@ pub(crate) struct ReadCtx {
     pub tag: u64,
     /// Sent with origin GETs so a changed object fails fast instead of mixing generations.
     pub if_match: Option<Bytes>,
-    pub size: Option<u64>,
+    /// Unknown only for bounded reads in immutable namespaces, learned from the first response.
+    pub meta: Option<ObjectMeta>,
+}
+
+impl ReadCtx {
+    pub fn new(
+        namespace: Arc<NamespaceState>,
+        key: ObjectKey,
+        name: Arc<str>,
+        meta: Option<ObjectMeta>,
+    ) -> Arc<Self> {
+        let consistency = namespace.config.consistency;
+        let (tag, if_match) = match &meta {
+            Some(m) => (
+                block_tag(consistency, m),
+                if consistency.is_immutable() {
+                    None
+                } else {
+                    m.etag.clone()
+                },
+            ),
+            None => (IMMUTABLE_TAG, None),
+        };
+        Arc::new(Self {
+            namespace,
+            key,
+            name,
+            tag,
+            if_match,
+            meta,
+        })
+    }
+
+    pub fn size(&self) -> Option<u64> {
+        self.meta.as_ref().map(|m| m.size)
+    }
 }
 
 pub(crate) struct Fetcher {
@@ -223,9 +258,96 @@ impl Fetcher {
         let mut owners = owners.into_iter();
         for group in groups {
             let slots: VecDeque<Slot> = owners.by_ref().take(group.count as usize).collect();
-            tokio::spawn(Arc::clone(self).fetch_group(Arc::clone(ctx), slots, priority));
+            tokio::spawn(Arc::clone(self).fetch_group(Arc::clone(ctx), slots, priority, None));
         }
         handles
+    }
+
+    pub async fn head(
+        &self,
+        ns: &Arc<NamespaceState>,
+        key: &ObjectKey,
+        name: &str,
+    ) -> Result<ObjectMeta, NestorError> {
+        ns.metrics.meta_heads.increment(1);
+        match ns.origin.head(name).await {
+            Ok(meta) => {
+                self.meta.put(key.clone(), meta.clone());
+                Ok(meta)
+            }
+            Err(e) => {
+                self.meta.remove(key);
+                Err(e.into())
+            }
+        }
+    }
+
+    /// Learns an object's metadata from the GET that a read needs anyway instead of a HEAD. The
+    /// response fills the blocks it covers, a stale `ETag` makes the request conditional so an
+    /// unchanged object costs no body.
+    pub async fn probe(
+        self: &Arc<Self>,
+        ns: &Arc<NamespaceState>,
+        name: &Arc<str>,
+        indexes: Range<u32>,
+        stale: Option<ObjectMeta>,
+    ) -> Result<Arc<ReadCtx>, NestorError> {
+        let key = ObjectKey::new(ns.id, name);
+        let ctx = ReadCtx::new(Arc::clone(ns), key.clone(), Arc::clone(name), None);
+        let bs = ns.config.block_size;
+        let options = GetOptions {
+            range: Some(bs.span(indexes.start, indexes.end - indexes.start, None)),
+            if_match: None,
+            if_none_match: stale.as_ref().and_then(|m| m.etag.clone()),
+        };
+        let build = |meta: ObjectMeta| {
+            self.meta.put(key.clone(), meta.clone());
+            ReadCtx::new(Arc::clone(ns), key.clone(), Arc::clone(name), Some(meta))
+        };
+        match self.origin_get(&ctx, options).await {
+            Ok(response) => {
+                let ctx = build(response.meta.clone());
+                self.adopt(&ctx, indexes, response);
+                Ok(ctx)
+            }
+            Err(OriginError::NotModified) => {
+                let meta = stale.ok_or(NestorError::Origin(OriginError::NotModified))?;
+                Ok(build(meta))
+            }
+            Err(OriginError::InvalidRange) => Ok(build(self.head(ns, &key, name).await?)),
+            Err(OriginError::NotFound) => {
+                self.meta.remove(&key);
+                Err(NestorError::NotFound)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Hands a probe response to the fetch pipeline for the leading blocks nobody else is already
+    /// fetching. Blocks past the first foreign owner are left to that owner.
+    fn adopt(self: &Arc<Self>, ctx: &Arc<ReadCtx>, indexes: Range<u32>, response: GetResponse) {
+        let end = indexes
+            .end
+            .min(ctx.namespace.config.block_size.count(response.meta.size));
+        let slots: VecDeque<Slot> = (indexes.start..end)
+            .map_while(|index| {
+                match self
+                    .inflight
+                    .register(BlockKey::new(&ctx.key, ctx.tag, index))
+                {
+                    Registration::Owner(slot, _) => Some(slot),
+                    Registration::Waiter(_) => None,
+                }
+            })
+            .collect();
+        if !slots.is_empty() {
+            tokio::spawn(Arc::clone(self).fetch_group(
+                Arc::clone(ctx),
+                slots,
+                Priority::Foreground,
+                Some(response),
+            ));
+        }
     }
 
     async fn fetch_group(
@@ -233,6 +355,7 @@ impl Fetcher {
         ctx: Arc<ReadCtx>,
         mut slots: VecDeque<Slot>,
         priority: Priority,
+        mut initial: Option<GetResponse>,
     ) {
         let semaphore = match priority {
             Priority::Foreground => &self.foreground,
@@ -244,7 +367,7 @@ impl Fetcher {
 
         let bs = ctx.namespace.config.block_size;
         let metrics = &ctx.namespace.metrics;
-        let mut size = ctx.size;
+        let mut size = ctx.size();
         let mut attempt = 0u32;
 
         while let Some(front) = slots.front() {
@@ -254,42 +377,20 @@ impl Fetcher {
                 return;
             }
 
-            let started = Instant::now();
-            metrics.origin_requests.increment(1);
-            match self.get_hedged(&ctx, range.clone()).await {
+            let result = if let Some(response) = initial.take() {
+                Ok(response)
+            } else {
+                let options = GetOptions {
+                    range: Some(range.clone()),
+                    if_match: ctx.if_match.clone(),
+                    if_none_match: None,
+                };
+                self.origin_get(&ctx, options).await
+            };
+            match result {
                 Ok(response) => {
-                    let ttfb = started.elapsed();
-                    ctx.namespace.latency.observe(ttfb);
-                    metrics.origin_ttfb.record(ttfb.as_secs_f64());
-                    self.meta.put(ctx.key.clone(), response.meta.clone());
                     size = Some(response.meta.size);
-
-                    if ctx.tag != IMMUTABLE_TAG
-                        && content_tag(response.meta.etag.as_ref(), response.meta.size) != ctx.tag
-                    {
-                        metrics.stale.increment(1);
-                        resolve_all(slots, &Err(Arc::new(NestorError::Stale)));
-                        return;
-                    }
-                    if response.range.start != range.start {
-                        metrics.origin_errors.increment(1);
-                        if !self
-                            .retry_or_fail(
-                                &ctx,
-                                &mut attempt,
-                                &mut slots,
-                                OriginError::ShortRead {
-                                    expected: range.end - range.start,
-                                    got: 0,
-                                },
-                            )
-                            .await
-                        {
-                            return;
-                        }
-                        continue;
-                    }
-                    match self.consume(&ctx, response, &mut slots, size).await {
+                    match self.accept(&ctx, response, &mut slots, &range).await {
                         Ok(()) => return,
                         Err(e) => {
                             metrics.origin_errors.increment(1);
@@ -333,6 +434,33 @@ impl Fetcher {
         }
     }
 
+    /// Checks a response against the read's generation and alignment, then streams it into the
+    /// slots. A stale generation fails the slots without retry, a misaligned start is retryable.
+    async fn accept(
+        &self,
+        ctx: &ReadCtx,
+        response: GetResponse,
+        slots: &mut VecDeque<Slot>,
+        range: &Range<u64>,
+    ) -> Result<(), OriginError> {
+        self.meta.put(ctx.key.clone(), response.meta.clone());
+        if ctx.tag != IMMUTABLE_TAG
+            && content_tag(response.meta.etag.as_ref(), response.meta.size) != ctx.tag
+        {
+            ctx.namespace.metrics.stale.increment(1);
+            resolve_all(std::mem::take(slots), &Err(Arc::new(NestorError::Stale)));
+            return Ok(());
+        }
+        if response.range.start != range.start {
+            return Err(OriginError::ShortRead {
+                expected: range.end - range.start,
+                got: 0,
+            });
+        }
+        let size = Some(response.meta.size);
+        self.consume(ctx, response, slots, size).await
+    }
+
     async fn retry_or_fail(
         &self,
         ctx: &ReadCtx,
@@ -351,16 +479,30 @@ impl Fetcher {
         false
     }
 
+    /// One origin GET with hedging, counted and timed for the namespace.
+    async fn origin_get(
+        &self,
+        ctx: &ReadCtx,
+        options: GetOptions,
+    ) -> Result<GetResponse, OriginError> {
+        let metrics = &ctx.namespace.metrics;
+        metrics.origin_requests.increment(1);
+        let started = Instant::now();
+        let result = self.get_hedged(ctx, options).await;
+        if result.is_ok() {
+            let ttfb = started.elapsed();
+            ctx.namespace.latency.observe(ttfb);
+            metrics.origin_ttfb.record(ttfb.as_secs_f64());
+        }
+        result
+    }
+
     async fn get_hedged(
         &self,
         ctx: &ReadCtx,
-        range: Range<u64>,
+        options: GetOptions,
     ) -> Result<GetResponse, OriginError> {
         let origin = &ctx.namespace.origin;
-        let options = GetOptions {
-            range: Some(range),
-            if_match: ctx.if_match.clone(),
-        };
         let mut primary = origin.get(&ctx.name, options.clone());
         let Some(hedge) = &ctx.namespace.config.hedge else {
             return primary.await;

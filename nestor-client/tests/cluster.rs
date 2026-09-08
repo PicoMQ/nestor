@@ -165,7 +165,7 @@ async fn read(origin: &ClusterOrigin, key: &str, range: Option<Range<u64>>) -> (
             key,
             GetOptions {
                 range,
-                if_match: None,
+                ..GetOptions::default()
             },
         )
         .await

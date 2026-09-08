@@ -173,6 +173,11 @@ impl Origin for MemoryOrigin {
         {
             return Err(OriginError::PreconditionFailed);
         }
+        if let Some(current) = &options.if_none_match
+            && *current == stored.etag
+        {
+            return Err(OriginError::NotModified);
+        }
         let meta = meta_of(&stored);
         let range = resolve(options.range, meta.size)?;
         let body = stored.body.slice(range.start as usize..range.end as usize);

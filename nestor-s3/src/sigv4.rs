@@ -2,6 +2,7 @@
 //! parsing.
 
 use std::fmt::Write as _;
+use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, KeyInit, Mac};
@@ -181,6 +182,51 @@ pub fn signature(key: &[u8; 32], string_to_sign: &str) -> String {
     hex::encode(hmac(key, string_to_sign.as_bytes()))
 }
 
+const SIGNING_KEYS_KEPT: usize = 8;
+
+struct SigningKey {
+    secret: String,
+    day: String,
+    region: String,
+    key: [u8; 32],
+}
+
+/// Derived signing keys. A key is fixed for a secret, day and region, so the four HMACs of
+/// `signing_key` run once per day instead of once per request.
+#[derive(Default)]
+pub struct SigningKeys {
+    entries: Mutex<Vec<SigningKey>>,
+}
+
+impl SigningKeys {
+    pub fn get(&self, secret: &str, day: &str, region: &str) -> [u8; 32] {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = entries
+            .iter()
+            .find(|e| e.day == day && e.region == region && e.secret == secret)
+        {
+            return entry.key;
+        }
+        let key = signing_key(secret, day, region);
+        if entries.len() == SIGNING_KEYS_KEPT {
+            entries.remove(0);
+        }
+        entries.push(SigningKey {
+            secret: secret.to_owned(),
+            day: day.to_owned(),
+            region: region.to_owned(),
+            key,
+        });
+        key
+    }
+}
+
+impl std::fmt::Debug for SigningKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SigningKeys").finish_non_exhaustive()
+    }
+}
+
 pub fn amz_date(now: DateTime<Utc>) -> String {
     now.format("%Y%m%dT%H%M%SZ").to_string()
 }
@@ -256,69 +302,78 @@ impl Authorization {
     }
 }
 
-pub fn sign(
-    method: &Method,
-    uri: &Uri,
-    host: &str,
-    headers: &mut HeaderMap,
-    creds: Credentials<'_>,
-    region: &str,
-    now: DateTime<Utc>,
-) {
-    let date = amz_date(now);
-    let day = date[..8].to_owned();
-    headers.insert(
-        X_AMZ_DATE,
-        HeaderValue::from_str(&date).expect("amz date is ascii"),
-    );
-    headers.insert(
-        X_AMZ_CONTENT_SHA256,
-        HeaderValue::from_static(UNSIGNED_PAYLOAD),
-    );
-    if let Some(token) = creds.session_token
-        && let Ok(v) = HeaderValue::from_str(token)
-    {
-        headers.insert(X_AMZ_SECURITY_TOKEN, v);
+impl SigningKeys {
+    /// Signs `headers` in place with an unsigned payload, the way the forwarder re-signs requests
+    /// for the origin. The `Host` header must already be set.
+    pub fn sign(
+        &self,
+        method: &Method,
+        uri: &Uri,
+        headers: &mut HeaderMap,
+        creds: Credentials<'_>,
+        region: &str,
+        now: DateTime<Utc>,
+    ) {
+        let host = headers
+            .get(HOST)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        let date = amz_date(now);
+        let day = date[..8].to_owned();
+        headers.insert(
+            X_AMZ_DATE,
+            HeaderValue::from_str(&date).expect("amz date is ascii"),
+        );
+        headers.insert(
+            X_AMZ_CONTENT_SHA256,
+            HeaderValue::from_static(UNSIGNED_PAYLOAD),
+        );
+        if let Some(token) = creds.session_token
+            && let Ok(v) = HeaderValue::from_str(token)
+        {
+            headers.insert(X_AMZ_SECURITY_TOKEN, v);
+        }
+
+        let mut signed: Vec<String> = headers
+            .keys()
+            .filter(|n| {
+                let s = n.as_str();
+                s.starts_with("x-amz-")
+                    || *n == HOST
+                    || *n == CONTENT_TYPE
+                    || s == "content-md5"
+                    || *n == RANGE
+            })
+            .map(|n| n.as_str().to_owned())
+            .collect();
+        signed.sort();
+        signed.dedup();
+
+        let canonical = canonical_request(&Canonical {
+            method: method.as_str(),
+            raw_path: uri.path(),
+            raw_query: uri.query().unwrap_or(""),
+            headers,
+            host: &host,
+            signed_headers: &signed,
+            payload_hash: UNSIGNED_PAYLOAD,
+            skip_query: None,
+        });
+        let sts = string_to_sign(&date, &scope(&day, region), &canonical);
+        let key = self.get(creds.secret_key, &day, region);
+        let auth = Authorization {
+            access_key: creds.access_key.to_owned(),
+            date: day,
+            region: region.to_owned(),
+            signed_headers: signed,
+            signature: signature(&key, &sts),
+        };
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&auth.header_value()).expect("authorization is ascii"),
+        );
     }
-
-    let mut signed: Vec<String> = headers
-        .keys()
-        .filter(|n| {
-            let s = n.as_str();
-            s.starts_with("x-amz-")
-                || *n == HOST
-                || *n == CONTENT_TYPE
-                || s == "content-md5"
-                || *n == RANGE
-        })
-        .map(|n| n.as_str().to_owned())
-        .collect();
-    signed.sort();
-    signed.dedup();
-
-    let canonical = canonical_request(&Canonical {
-        method: method.as_str(),
-        raw_path: uri.path(),
-        raw_query: uri.query().unwrap_or(""),
-        headers,
-        host,
-        signed_headers: &signed,
-        payload_hash: UNSIGNED_PAYLOAD,
-        skip_query: None,
-    });
-    let sts = string_to_sign(&date, &scope(&day, region), &canonical);
-    let key = signing_key(creds.secret_key, &day, region);
-    let auth = Authorization {
-        access_key: creds.access_key.to_owned(),
-        date: day,
-        region: region.to_owned(),
-        signed_headers: signed,
-        signature: signature(&key, &sts),
-    };
-    headers.insert(
-        AUTHORIZATION,
-        HeaderValue::from_str(&auth.header_value()).expect("authorization is ascii"),
-    );
 }
 
 #[cfg(test)]
@@ -358,6 +413,21 @@ mod tests {
             signature(&key, sts),
             "f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"
         );
+    }
+
+    #[test]
+    fn signing_keys_are_derived_once_per_scope() {
+        let keys = SigningKeys::default();
+        let secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let first = keys.get(secret, "20130524", "us-east-1");
+        assert_eq!(first, signing_key(secret, "20130524", "us-east-1"));
+        assert_eq!(keys.get(secret, "20130524", "us-east-1"), first);
+        assert_ne!(keys.get(secret, "20130525", "us-east-1"), first);
+        assert_eq!(keys.entries.lock().unwrap().len(), 2);
+        for day in 0..SIGNING_KEYS_KEPT {
+            keys.get(secret, &format!("2014010{day}"), "eu-west-1");
+        }
+        assert_eq!(keys.entries.lock().unwrap().len(), SIGNING_KEYS_KEPT);
     }
 
     #[test]

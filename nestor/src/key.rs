@@ -7,6 +7,9 @@ use std::io::{Read, Write};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use foyer::{Code, Error};
 
+use crate::namespace::Consistency;
+use crate::origin::ObjectMeta;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NamespaceId(pub(crate) u32);
 
@@ -102,6 +105,14 @@ pub fn content_tag(etag: Option<&Bytes>, size: u64) -> u64 {
 
 /// Tag used by namespaces that never revalidate.
 pub const IMMUTABLE_TAG: u64 = 0;
+
+pub(crate) fn block_tag(consistency: Consistency, meta: &ObjectMeta) -> u64 {
+    if consistency.is_immutable() {
+        IMMUTABLE_TAG
+    } else {
+        content_tag(meta.etag.as_ref(), meta.size)
+    }
+}
 
 #[cfg(test)]
 mod tests {

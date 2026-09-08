@@ -37,6 +37,10 @@ pub(crate) fn path_of(object: &str) -> Path {
     Path::parse(object).unwrap_or_else(|_| Path::from(object))
 }
 
+fn etag_string(etag: &[u8]) -> String {
+    String::from_utf8_lossy(etag).into_owned()
+}
+
 pub(crate) fn meta_from_store(meta: &object_store::ObjectMeta) -> ObjectMeta {
     ObjectMeta {
         size: meta.size,
@@ -54,9 +58,8 @@ impl Origin for ObjectStoreOrigin {
         let path = path_of(object);
         let get = object_store::GetOptions {
             range: options.range.map(GetRange::Bounded),
-            if_match: options
-                .if_match
-                .map(|etag| String::from_utf8_lossy(&etag).into_owned()),
+            if_match: options.if_match.as_deref().map(etag_string),
+            if_none_match: options.if_none_match.as_deref().map(etag_string),
             ..Default::default()
         };
         let result = self.store.get_opts(&path, get).await.map_err(from_store)?;

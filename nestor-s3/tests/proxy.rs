@@ -5,7 +5,7 @@ use axum::body::{Body, to_bytes};
 use bytes::Bytes;
 use http::{Method, Request, Response, StatusCode, Uri};
 use nestor::{BlockSize, CacheConfig, Consistency, Nestor};
-use nestor_s3::sigv4::Credentials;
+use nestor_s3::sigv4::{Credentials, SigningKeys};
 use nestor_s3::{Addressing, Auth, OriginConfig, S3Config, S3Service};
 use tower::ServiceExt;
 use wiremock::matchers::{header_exists, method, path, query_param};
@@ -99,7 +99,7 @@ async fn get_is_served_from_cache_after_first_miss() {
     let (origin, router, _) = setup(Auth::Anonymous, None).await;
     Mock::given(path("/data/obj.bin"))
         .respond_with(ObjectResponder(Bytes::from_static(OBJECT)))
-        .expect(2)
+        .expect(1)
         .mount(&origin)
         .await;
 
@@ -219,13 +219,13 @@ async fn put_populates_cache_and_delete_invalidates() {
     Mock::given(method("GET"))
         .and(path("/data/new.bin"))
         .respond_with(ResponseTemplate::new(404))
-        .expect(0)
+        .expect(1)
         .mount(&origin)
         .await;
     Mock::given(method("HEAD"))
         .and(path("/data/new.bin"))
         .respond_with(ResponseTemplate::new(404))
-        .expect(1)
+        .expect(0)
         .mount(&origin)
         .await;
     Mock::given(method("DELETE"))
@@ -282,10 +282,9 @@ async fn static_auth_rejects_unsigned_and_accepts_signed() {
 
     let mut signed = get("/data/obj.bin");
     let uri = signed.uri().clone();
-    nestor_s3::sigv4::sign(
+    SigningKeys::default().sign(
         &Method::GET,
         &uri,
-        "localhost",
         signed.headers_mut(),
         Credentials {
             access_key: "client-ak",

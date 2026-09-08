@@ -17,7 +17,7 @@ use crate::body::{Capture, request_body};
 use crate::error::S3Error;
 use crate::origin::OriginConfig;
 use crate::sigv4::{
-    Credentials, X_AMZ_CONTENT_SHA256, X_AMZ_DATE, X_AMZ_SECURITY_TOKEN, sign, uri_encode,
+    Credentials, SigningKeys, X_AMZ_CONTENT_SHA256, X_AMZ_DATE, X_AMZ_SECURITY_TOKEN, uri_encode,
 };
 
 const PRESIGN_PARAMS: &[&str] = &[
@@ -100,6 +100,7 @@ fn upstream_headers(incoming: &HeaderMap, streaming: bool) -> Result<HeaderMap, 
 pub struct Forwarder {
     client: Client<HttpsConnector<HttpConnector>, Body>,
     origin: OriginConfig,
+    signing_keys: SigningKeys,
 }
 
 impl Forwarder {
@@ -116,7 +117,11 @@ impl Forwarder {
         let client = Client::builder(TokioExecutor::new())
             .pool_max_idle_per_host(64)
             .build(https);
-        Self { client, origin }
+        Self {
+            client,
+            origin,
+            signing_keys: SigningKeys::default(),
+        }
     }
 
     fn upstream_uri(&self, target: &Target, raw_query: &str) -> Result<(Uri, String), S3Error> {
@@ -186,10 +191,9 @@ impl Forwarder {
             let credential = provider.get_credential().await.map_err(|e| {
                 S3Error::bad_gateway(format!("failed to obtain origin credentials: {e}"))
             })?;
-            sign(
+            self.signing_keys.sign(
                 &parts.method,
                 &uri,
-                &host,
                 &mut headers,
                 Credentials {
                     access_key: &credential.key_id,

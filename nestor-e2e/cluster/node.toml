@@ -13,8 +13,7 @@ access_key = "nestor"
 secret_key = "nestornestor"
 
 [cache]
-memory = "512 MiB"
-shards = 16
+memory = "128 MiB"
 
 [buckets]
 block_size = "1 MiB"

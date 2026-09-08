@@ -100,6 +100,7 @@ impl Preconditions {
 pub struct GetOptions {
     pub range: Option<Range<u64>>,
     pub if_match: Option<Bytes>,
+    pub if_none_match: Option<Bytes>,
 }
 
 pub struct GetResponse {

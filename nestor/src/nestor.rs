@@ -13,9 +13,9 @@ use crate::block::ReadRange;
 use crate::cache::{self, CacheConfig};
 use crate::error::{NestorError, Result};
 use crate::fetch::{Fetcher, Priority, ReadCtx, RetryConfig};
-use crate::key::{BlockKey, IMMUTABLE_TAG, NamespaceId, ObjectKey, content_tag};
-use crate::meta::MetaCache;
-use crate::namespace::{Consistency, Namespace, NamespaceState};
+use crate::key::{BlockKey, IMMUTABLE_TAG, NamespaceId, ObjectKey, block_tag};
+use crate::meta::{MetaCache, MetaLookup};
+use crate::namespace::{Namespace, NamespaceState};
 use crate::origin::ObjectMeta;
 use crate::readahead::Readahead;
 use crate::reader::{ReadStream, Reader};
@@ -45,61 +45,41 @@ impl Engine {
             .ok_or(NestorError::UnknownNamespace)
     }
 
+    /// Everything a read needs before its first block. Served from the metadata cache when fresh,
+    /// otherwise learned from the read's own first GET. Only suffix ranges still need a HEAD.
     pub(crate) async fn resolve_ctx(
         &self,
         ns: &Arc<NamespaceState>,
         name: &Arc<str>,
-        need_meta: bool,
+        request: &ReadRange,
     ) -> Result<Arc<ReadCtx>> {
         let key = ObjectKey::new(ns.id, name);
-        let immutable = ns.config.consistency.is_immutable();
-        let mut meta = self.meta.get(&key, ns.meta_ttl());
-        if meta.is_none() && (need_meta || !immutable) {
-            let fetched = self.head_origin(ns, &key, name).await?;
-            meta = Some(fetched);
-        }
-        let (tag, if_match) = match &meta {
-            Some(m) => (
-                block_tag(ns.config.consistency, m),
-                if immutable { None } else { m.etag.clone() },
-            ),
-            None => (IMMUTABLE_TAG, None),
+        let stale = match self.meta.lookup(&key, ns.meta_ttl()) {
+            MetaLookup::Fresh(meta) => {
+                return Ok(ReadCtx::new(
+                    Arc::clone(ns),
+                    key,
+                    Arc::clone(name),
+                    Some(meta),
+                ));
+            }
+            MetaLookup::Stale(meta) => Some(meta),
+            MetaLookup::Missing => None,
         };
-        Ok(Arc::new(ReadCtx {
-            namespace: Arc::clone(ns),
-            key,
-            name: Arc::clone(name),
-            tag,
-            if_match,
-            size: meta.map(|m| m.size),
-        }))
-    }
-
-    async fn head_origin(
-        &self,
-        ns: &NamespaceState,
-        key: &ObjectKey,
-        name: &str,
-    ) -> Result<ObjectMeta> {
-        ns.metrics.meta_heads.increment(1);
-        match ns.origin.head(name).await {
-            Ok(meta) => {
-                self.meta.put(key.clone(), meta.clone());
-                Ok(meta)
-            }
-            Err(e) => {
-                self.meta.remove(key);
-                Err(e.into())
-            }
+        if ns.config.consistency.is_immutable() && !request.needs_size() {
+            return Ok(ReadCtx::new(Arc::clone(ns), key, Arc::clone(name), None));
         }
-    }
-}
-
-fn block_tag(consistency: Consistency, meta: &ObjectMeta) -> u64 {
-    if consistency.is_immutable() {
-        IMMUTABLE_TAG
-    } else {
-        content_tag(meta.etag.as_ref(), meta.size)
+        let window = ns.config.fetch_window;
+        if let Some(indexes) = ns.config.block_size.first_group(request, window) {
+            return self.fetcher.probe(ns, name, indexes, stale).await;
+        }
+        let meta = self.fetcher.head(ns, &key, name).await?;
+        Ok(ReadCtx::new(
+            Arc::clone(ns),
+            key,
+            Arc::clone(name),
+            Some(meta),
+        ))
     }
 }
 
@@ -252,7 +232,7 @@ impl Nestor {
         if let Some(meta) = self.engine.meta.get(&key, state.meta_ttl()) {
             return Ok(meta);
         }
-        self.engine.head_origin(&state, &key, object).await
+        self.engine.fetcher.head(&state, &key, object).await
     }
 
     pub async fn get(
@@ -264,11 +244,8 @@ impl Nestor {
         let state = self.state(ns)?;
         let request: ReadRange = range.into();
         let name: Arc<str> = Arc::from(object);
-        let ctx = self
-            .engine
-            .resolve_ctx(&state, &name, request.needs_size())
-            .await?;
-        let range = match (ctx.size, &request) {
+        let ctx = self.engine.resolve_ctx(&state, &name, &request).await?;
+        let range = match (ctx.size(), &request) {
             (Some(size), _) => request.resolve(size)?,
             (None, ReadRange::Bounded(r)) => {
                 if r.start >= r.end {
@@ -290,7 +267,7 @@ impl Nestor {
         let bs = state.config.block_size;
         let start = bs.count(range.end);
         let mut end = start + state.config.readahead;
-        if let Some(size) = ctx.size {
+        if let Some(size) = ctx.size() {
             end = end.min(bs.count(size));
         }
         if start >= end {

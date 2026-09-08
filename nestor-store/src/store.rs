@@ -177,33 +177,25 @@ impl ObjectStore for NestorStore {
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
         let key = location.as_ref();
         let preconditions = preconditions(&options);
-        let mut meta = None;
-        if !preconditions.is_empty() || options.head {
-            let m = self.meta(location).await?;
-            match preconditions.evaluate(&m) {
-                Precondition::NotModified => {
-                    return Err(Error::NotModified {
-                        path: key.to_owned(),
-                        source: "preconditions not modified".into(),
-                    });
-                }
-                Precondition::Failed => {
-                    return Err(Error::Precondition {
-                        path: key.to_owned(),
-                        source: "preconditions failed".into(),
-                    });
-                }
-                Precondition::Satisfied => {}
-            }
-            meta = Some(to_store_meta(location.clone(), &m));
-        }
+        let check = |meta: &NestorMeta| match preconditions.evaluate(meta) {
+            Precondition::NotModified => Err(Error::NotModified {
+                path: key.to_owned(),
+                source: "preconditions not modified".into(),
+            }),
+            Precondition::Failed => Err(Error::Precondition {
+                path: key.to_owned(),
+                source: "preconditions failed".into(),
+            }),
+            Precondition::Satisfied => Ok(()),
+        };
 
         if options.head {
-            let meta = meta.expect("meta resolved for head");
+            let meta = self.meta(location).await?;
+            check(&meta)?;
             let size = meta.size;
             return Ok(GetResult {
                 payload: GetResultPayload::Stream(futures::stream::empty().boxed()),
-                meta,
+                meta: to_store_meta(location.clone(), &meta),
                 range: 0..size,
                 attributes: Attributes::default(),
                 extensions: Extensions::default(),
@@ -215,35 +207,13 @@ impl ObjectStore for NestorStore {
             .get(self.ns, key, read_range(options.range))
             .await
             .map_err(|e| to_store(e, key))?;
+        let meta = stream.ready().await.map_err(|e| to_store(e, key))?;
+        check(meta)?;
+        let meta = to_store_meta(location.clone(), meta);
+        let range = stream.range();
         let path = key.to_owned();
-        let requested = stream.range().clone();
-        let (meta, payload): (ObjectMeta, BoxStream<'static, Result<Bytes>>) =
-            match (meta, stream.meta().cloned()) {
-                (Some(m), _) => (m, stream.map_err(move |e| to_store(e, &path)).boxed()),
-                (None, Some(m)) => (
-                    to_store_meta(location.clone(), &m),
-                    stream.map_err(move |e| to_store(e, &path)).boxed(),
-                ),
-                (None, None) => {
-                    let first = stream
-                        .next()
-                        .await
-                        .transpose()
-                        .map_err(|e| to_store(e, key))?;
-                    let meta = to_store_meta(location.clone(), &self.meta(location).await?);
-                    let rest = stream.map_err(move |e| to_store(e, &path));
-                    let payload = match first {
-                        Some(chunk) => futures::stream::once(async move { Ok(chunk) })
-                            .chain(rest)
-                            .boxed(),
-                        None => rest.boxed(),
-                    };
-                    (meta, payload)
-                }
-            };
-        let range = requested.start..requested.end.min(meta.size);
         Ok(GetResult {
-            payload: GetResultPayload::Stream(payload),
+            payload: GetResultPayload::Stream(stream.map_err(move |e| to_store(e, &path)).boxed()),
             meta,
             range,
             attributes: Attributes::default(),

@@ -14,6 +14,7 @@ use crate::error::S3Error;
 use crate::forward::Forwarder;
 use crate::origin::{OriginConfig, Origins};
 use crate::routes;
+use crate::sigv4::SigningKeys;
 
 #[derive(Clone)]
 pub struct S3Config {
@@ -43,6 +44,7 @@ pub struct S3Service {
     pub(crate) forwarder: Forwarder,
     pub(crate) origins: Arc<dyn Origins>,
     pub(crate) auth: Auth,
+    pub(crate) signing_keys: SigningKeys,
     pub(crate) addressing: Addressing,
     pub(crate) populate_max: Option<usize>,
     buckets: NamespaceConfig,
@@ -59,6 +61,7 @@ impl S3Service {
             forwarder: Forwarder::new(config.origin),
             origins,
             auth: config.auth,
+            signing_keys: SigningKeys::default(),
             addressing: config.addressing,
             populate_max: config.populate_max,
             buckets: config.buckets,

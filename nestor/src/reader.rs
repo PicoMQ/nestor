@@ -4,7 +4,7 @@
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 
 use bytes::{Bytes, BytesMut};
@@ -20,33 +20,54 @@ use crate::origin::ObjectMeta;
 pub struct ReadStream {
     stream: BoxStream<'static, Result<Bytes>>,
     range: Range<u64>,
-    size: Option<u64>,
-    meta: Option<ObjectMeta>,
+    known: Arc<OnceLock<ObjectMeta>>,
+    peeked: Option<Bytes>,
 }
 
 impl ReadStream {
-    pub fn range(&self) -> &Range<u64> {
-        &self.range
-    }
-
-    pub fn content_length(&self) -> Option<u64> {
-        self.size.map(|_| self.range.end - self.range.start)
+    pub fn meta(&self) -> Option<&ObjectMeta> {
+        self.known.get()
     }
 
     pub fn size(&self) -> Option<u64> {
-        self.size
+        self.meta().map(|m| m.size)
     }
 
-    pub fn meta(&self) -> Option<&ObjectMeta> {
-        self.meta.as_ref()
+    /// The requested range, clipped to the object once its size is known.
+    pub fn range(&self) -> Range<u64> {
+        match self.size() {
+            Some(size) => self.range.start..self.range.end.min(size),
+            None => self.range.clone(),
+        }
+    }
+
+    pub fn content_length(&self) -> Option<u64> {
+        self.size().map(|_| {
+            let range = self.range();
+            range.end - range.start
+        })
+    }
+
+    /// Waits until the object's metadata is known, pulling the first chunk if that is what it
+    /// takes. The chunk is replayed by the stream afterwards.
+    pub async fn ready(&mut self) -> Result<&ObjectMeta> {
+        if self.known.get().is_none()
+            && self.peeked.is_none()
+            && let Some(first) = self.next().await
+        {
+            self.peeked = Some(first?);
+        }
+        self.known
+            .get()
+            .ok_or_else(|| NestorError::Range(self.range.clone(), 0))
     }
 
     pub async fn collect(mut self) -> Result<Bytes> {
-        let Some(first) = self.stream.next().await else {
+        let Some(first) = self.next().await else {
             return Ok(Bytes::new());
         };
         let first = first?;
-        let Some(second) = self.stream.next().await else {
+        let Some(second) = self.next().await else {
             return Ok(first);
         };
         let mut buf = BytesMut::with_capacity(
@@ -55,7 +76,7 @@ impl ReadStream {
         );
         buf.extend_from_slice(&first);
         buf.extend_from_slice(&second?);
-        while let Some(chunk) = self.stream.next().await {
+        while let Some(chunk) = self.next().await {
             buf.extend_from_slice(&chunk?);
         }
         Ok(buf.freeze())
@@ -66,6 +87,9 @@ impl Stream for ReadStream {
     type Item = Result<Bytes>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(chunk) = self.peeked.take() {
+            return Poll::Ready(Some(Ok(chunk)));
+        }
         self.stream.as_mut().poll_next(cx)
     }
 }
@@ -73,8 +97,8 @@ impl Stream for ReadStream {
 impl std::fmt::Debug for ReadStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReadStream")
-            .field("range", &self.range)
-            .field("size", &self.size)
+            .field("range", &self.range())
+            .field("meta", &self.meta())
             .finish_non_exhaustive()
     }
 }
@@ -84,7 +108,8 @@ pub(crate) struct Reader {
     request: ReadRange,
     ctx: Arc<ReadCtx>,
     range: Range<u64>,
-    size: Option<u64>,
+    /// Shared with the `ReadStream`, set as soon as the object's metadata is known.
+    known: Arc<OnceLock<ObjectMeta>>,
     /// Block indexes. `first..end` cover the range, `next` is the next to schedule, `emit` the next
     /// to yield.
     first: u32,
@@ -105,10 +130,14 @@ impl Reader {
         range: Range<u64>,
     ) -> Self {
         let blocks = ctx.namespace.config.block_size.blocks(&range);
+        let known = Arc::new(OnceLock::new());
+        if let Some(meta) = &ctx.meta {
+            let _ = known.set(meta.clone());
+        }
         Self {
             engine,
             request,
-            size: ctx.size,
+            known,
             ctx,
             range,
             first: blocks.start,
@@ -123,12 +152,7 @@ impl Reader {
 
     pub fn into_stream(self) -> ReadStream {
         let range = self.range.clone();
-        let size = self.size;
-        let meta = self.size.and_then(|_| {
-            self.engine
-                .meta
-                .get(&self.ctx.key, self.ctx.namespace.meta_ttl())
-        });
+        let known = Arc::clone(&self.known);
         let stream = futures::stream::unfold(self, |mut reader| async move {
             let item = reader.next().await;
             item.map(|item| (item, reader))
@@ -137,32 +161,32 @@ impl Reader {
         ReadStream {
             stream,
             range,
-            size,
-            meta,
+            known,
+            peeked: None,
         }
     }
 
+    fn size(&self) -> Option<u64> {
+        self.known.get().map(|m| m.size)
+    }
+
     fn learn_size(&mut self) {
-        if self.size.is_some() {
+        if self.known.get().is_some() {
             return;
         }
-        if let Some(meta) = self
-            .engine
-            .meta
-            .get(&self.ctx.key, self.ctx.namespace.meta_ttl())
-        {
-            self.size = Some(meta.size);
+        if let Some(meta) = self.engine.meta.any(&self.ctx.key) {
             self.range.end = self.range.end.min(meta.size);
             self.end = self
                 .end
                 .min(self.ctx.namespace.config.block_size.count(meta.size));
+            let _ = self.known.set(meta);
         }
     }
 
     async fn fill(&mut self) {
         self.learn_size();
         let config = self.ctx.namespace.config;
-        let limit = if self.size.is_some() {
+        let limit = if self.size().is_some() {
             config.read_window
         } else {
             config.fetch_window
@@ -179,7 +203,7 @@ impl Reader {
                 .await;
             self.next += take;
             self.window.extend(handles);
-            if self.size.is_none() {
+            if self.size().is_none() {
                 return;
             }
         }
@@ -190,13 +214,13 @@ impl Reader {
         self.window.clear();
         let ctx = self
             .engine
-            .resolve_ctx(&self.ctx.namespace, &self.ctx.name, true)
+            .resolve_ctx(&self.ctx.namespace, &self.ctx.name, &self.request)
             .await?;
-        let size = ctx.size.ok_or(NestorError::Stale)?;
-        self.range = self.request.resolve(size)?;
+        let meta = ctx.meta.clone().ok_or(NestorError::Stale)?;
+        self.range = self.request.resolve(meta.size)?;
         let blocks = ctx.namespace.config.block_size.blocks(&self.range);
         self.ctx = ctx;
-        self.size = Some(size);
+        self.known = Arc::new(OnceLock::from(meta));
         self.first = blocks.start;
         self.next = blocks.start;
         self.end = blocks.end;
@@ -224,7 +248,7 @@ impl Reader {
                     if block.is_empty() || within.start >= block.len() {
                         self.done = true;
                         if index == self.first {
-                            let size = self.size.unwrap_or(0);
+                            let size = self.size().unwrap_or(0);
                             return Some(Err(NestorError::Range(self.range.clone(), size)));
                         }
                         return None;

@@ -68,6 +68,19 @@ impl BlockSize {
         }
     }
 
+    /// Blocks the first origin GET for `request` covers. `None` when the start depends on the
+    /// object size.
+    pub(crate) fn first_group(self, request: &ReadRange, window: u32) -> Option<Range<u32>> {
+        let (start, end) = match request {
+            ReadRange::Full => (0, u32::MAX),
+            ReadRange::From(start) => (self.index(*start), u32::MAX),
+            ReadRange::Bounded(r) => (self.index(r.start), self.count(r.end)),
+            ReadRange::Suffix(_) => return None,
+        };
+        let take = aligned_take(start, end.max(start.saturating_add(1)), window);
+        Some(start..start + take)
+    }
+
     pub fn slice_within(self, index: u32, range: &Range<u64>) -> Range<usize> {
         let block_start = self.offset(index);
         let block_end = block_start + self.bytes();
@@ -220,6 +233,19 @@ mod tests {
         assert_eq!(aligned_take(3, 11, 4), 1);
         assert_eq!(aligned_take(8, 11, 4), 3);
         assert_eq!(aligned_take(u32::MAX - 1, u32::MAX, 4), 1);
+    }
+
+    #[test]
+    fn first_group_follows_the_request() {
+        let bs = BlockSize::new(1 << 20).unwrap();
+        assert_eq!(bs.first_group(&ReadRange::Full, 4), Some(0..4));
+        assert_eq!(bs.first_group(&ReadRange::From(5 << 20), 4), Some(5..8));
+        assert_eq!(
+            bs.first_group(&ReadRange::Bounded((1 << 20) + 7..(2 << 20) + 1), 4),
+            Some(1..3)
+        );
+        assert_eq!(bs.first_group(&ReadRange::Bounded(9..9), 4), Some(0..1));
+        assert_eq!(bs.first_group(&ReadRange::Suffix(10), 4), None);
     }
 
     #[test]

@@ -9,6 +9,7 @@ pub(crate) fn from_store(e: Error) -> OriginError {
     match e {
         Error::NotFound { .. } => OriginError::NotFound,
         Error::Precondition { .. } => OriginError::PreconditionFailed,
+        Error::NotModified { .. } => OriginError::NotModified,
         Error::Generic { ref source, .. } if is_invalid_range(source.as_ref()) => {
             OriginError::InvalidRange
         }
