@@ -1,0 +1,29 @@
+[server]
+listen = "0.0.0.0:9000"
+metrics = "0.0.0.0:9100"
+
+[origin]
+endpoint = "http://rustfs:9000"
+region = "us-east-1"
+credentials = { source = "static", access_key = "nestor", secret_key = "nestornestor" }
+
+[auth]
+mode = "static"
+access_key = "nestor"
+secret_key = "nestornestor"
+
+[cache]
+memory = "16 MiB"
+
+[buckets]
+block_size = "1 MiB"
+consistency = { mode = "immutable" }
+readahead = 0
+
+[cluster]
+dns = "nodes:9000"
+refresh = "2s"
+block_size = "2 MiB"
+down_for = "2s"
+credentials = { access_key = "nestor", secret_key = "nestornestor" }
+warm_on_write = true

@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 nestor = { workspace = true, features = ["serde"] }
 nestor-s3 = { workspace = true }
+nestor-client = { workspace = true }
 
 axum = { workspace = true }
 axum-server = { workspace = true }
@@ -21,6 +22,7 @@ byte-unit = { workspace = true }
 clap = { workspace = true }
 eyre = { workspace = true }
 figment = { workspace = true }
+humantime-serde = { workspace = true }
 http = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }

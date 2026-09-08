@@ -1,4 +1,5 @@
 //! Origin endpoint and credentials shared by the forwarder and the per-bucket Nestor origins.
+//! `Origins` is where reads come from, by default the same endpoint writes are forwarded to.
 
 use std::sync::Arc;
 
@@ -10,6 +11,20 @@ use object_store::StaticCredentialProvider;
 use object_store::aws::{AmazonS3Builder, AwsCredential, AwsCredentialProvider};
 
 use crate::error::S3Error;
+
+pub trait Origins: Send + Sync + 'static {
+    fn origin(&self, bucket: &str) -> Result<Arc<dyn Origin>, S3Error>;
+
+    fn written(&self, bucket: &str, key: &str, size: u64) {
+        let _ = (bucket, key, size);
+    }
+}
+
+impl Origins for OriginConfig {
+    fn origin(&self, bucket: &str) -> Result<Arc<dyn Origin>, S3Error> {
+        self.bucket_origin(bucket)
+    }
+}
 
 #[derive(Clone)]
 pub struct OriginConfig {
@@ -66,7 +81,7 @@ impl OriginConfig {
         self.endpoint.authority()
     }
 
-    pub(crate) fn bucket_origin(&self, bucket: &str) -> Result<Arc<dyn Origin>, S3Error> {
+    fn bucket_origin(&self, bucket: &str) -> Result<Arc<dyn Origin>, S3Error> {
         let mut builder = AmazonS3Builder::new()
             .with_bucket_name(bucket)
             .with_region(self.region.clone())

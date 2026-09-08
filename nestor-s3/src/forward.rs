@@ -119,10 +119,6 @@ impl Forwarder {
         Self { client, origin }
     }
 
-    pub fn origin(&self) -> &OriginConfig {
-        &self.origin
-    }
-
     fn upstream_uri(&self, target: &Target, raw_query: &str) -> Result<(Uri, String), S3Error> {
         let authority = self
             .origin

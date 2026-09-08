@@ -5,6 +5,8 @@ members = [
     "nestor-store",
     "nestor-s3",
     "nestor-cli",
+    "nestor-client",
+    "nestor-e2e",
 ]
 
 [workspace.package]
@@ -13,12 +15,13 @@ edition = "2024"
 rust-version = "1.98"
 license = "Apache-2.0"
 description = "A block-based read-through cache for object storage."
-repository = "https://github.com/nestor-cache/nestor"
+repository = "https://github.com/PicoMQ/nestor"
 
 [workspace.dependencies]
 nestor = { path = "nestor" }
 nestor-store = { path = "nestor-store" }
 nestor-s3 = { path = "nestor-s3" }
+nestor-client = { path = "nestor-client" }
 
 foyer = "0.22.5"
 mixtrics = "0.2.5"
@@ -63,6 +66,7 @@ proptest = "1.11.0"
 tempfile = "3.27.0"
 criterion = { version = "0.8.2", features = ["async_tokio"] }
 wiremock = "0.6.5"
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
 tower = { version = "0.5.2", features = ["util"] }
 
 [workspace.lints.rust]

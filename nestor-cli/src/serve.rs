@@ -8,6 +8,7 @@ use axum_server::tls_rustls::RustlsConfig;
 use eyre::{Context, Report};
 use nestor_s3::S3Service;
 
+use crate::cluster::ClusterOrigins;
 use crate::config::Config;
 use crate::telemetry::Telemetry;
 
@@ -28,7 +29,11 @@ pub async fn run(config: Config) -> Result<(), Report> {
     }
 
     let nestor = builder.build().await.wrap_err("initialising cache")?;
-    let service = S3Service::new(nestor.clone(), config.s3()?);
+    let mut s3 = config.s3()?;
+    if let Some(cluster) = &config.cluster {
+        s3.origins = Some(ClusterOrigins::connect(cluster).await?);
+    }
+    let service = S3Service::new(nestor.clone(), s3);
     let router = service.router();
 
     let handle: Handle<SocketAddr> = Handle::new();

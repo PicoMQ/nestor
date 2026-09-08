@@ -16,5 +16,5 @@ pub mod sigv4;
 pub use addressing::{Addressing, Target};
 pub use auth::Auth;
 pub use error::S3Error;
-pub use origin::OriginConfig;
+pub use origin::{OriginConfig, Origins};
 pub use service::{S3Config, S3Service};

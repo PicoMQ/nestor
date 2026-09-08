@@ -20,7 +20,7 @@ mod reader;
 pub use block::{BlockSize, MAX_BLOCK_SIZE, MIN_BLOCK_SIZE, ReadRange};
 pub use cache::{CacheConfig, DiskConfig};
 pub use error::{NestorError, OriginError, Result};
-pub use fetch::{HedgeConfig, RetryConfig};
+pub use fetch::{HedgeConfig, Latency, RetryConfig};
 pub use foyer::{Compression, RecoverMode};
 pub use key::NamespaceId;
 pub use memory::MemoryOrigin;

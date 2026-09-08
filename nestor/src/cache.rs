@@ -123,9 +123,10 @@ pub async fn build(
         .with_compression(disk.compression);
 
     #[cfg(target_os = "linux")]
-    let storage = storage.with_io_engine_config(foyer::UringIoEngineConfig::new());
+    let io_engine: Box<dyn foyer::IoEngineConfig> = Box::new(foyer::UringIoEngineConfig::new());
     #[cfg(not(target_os = "linux"))]
-    let storage = storage.with_io_engine_config(foyer::PsyncIoEngineConfig::new());
+    let io_engine: Box<dyn foyer::IoEngineConfig> = Box::new(foyer::PsyncIoEngineConfig::new());
+    let storage = storage.with_io_engine_config(io_engine);
 
     storage.build().await
 }

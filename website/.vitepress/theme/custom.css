@@ -881,7 +881,7 @@ html {
     );
     min-height: calc(100vh - var(--vp-nav-height));
     margin: 0 auto !important;
-    padding-top: 8.5rem;
+    padding-top: 7.5rem;
   }
 
   .VPHome .VPHero {

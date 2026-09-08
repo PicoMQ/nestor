@@ -48,3 +48,18 @@ consistency = { mode = "etag", ttl = "60s" }   # or { mode = "immutable" }
 readahead = 8                 # blocks prefetched on sequential access, 0 disables
 hedge = { factor = 3.0, min = "50ms", max = "2s" }
 populate_max = "16 MiB"       # PUT bodies up to this size are cached on the way through
+
+# Serve reads from a cluster of nestor nodes instead of the origin. This binary becomes the local
+# tier, writes still go to [origin]. Use either nodes or dns.
+# [cluster]
+# nodes = ["10.0.1.5:9000", "10.0.1.6:9000"]
+# dns = "nestor.cache.svc:9000"
+# refresh = "10s"             # how often dns is re-resolved
+# block_size = "1 MiB"        # routing unit, a multiple of buckets.block_size
+# read_window = 16            # blocks in flight per read
+# load_limit = 256            # in flight requests per node before spilling to the next choice
+# down_for = "5s"             # how long a node is skipped after a connection failure
+# hedge = { factor = 3.0, min = "50ms", max = "2s" }
+# tls = false
+# credentials = { access_key = "...", secret_key = "..." }   # what the nodes' [auth] expects
+# warm_on_write = false       # after a PUT, fetch each block on its owning node

@@ -3,6 +3,7 @@
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use byte_unit::Byte;
 use eyre::{Context, Report, bail};
@@ -13,6 +14,7 @@ use nestor::{
     BlockSize, CacheConfig, Compression, Consistency, DiskConfig, HedgeConfig, NamespaceConfig,
     NestorBuilder, RecoverMode, RetryConfig,
 };
+use nestor_client::{ClusterConfig, Credentials, Membership};
 use nestor_s3::{Addressing, Auth, OriginConfig, S3Config};
 use serde::Deserialize;
 
@@ -24,6 +26,7 @@ pub struct Config {
     pub auth: AuthMode,
     pub cache: Cache,
     pub buckets: Buckets,
+    pub cluster: Option<Cluster>,
 }
 
 impl Config {
@@ -42,6 +45,16 @@ impl Config {
         if self.origin.endpoint.authority().is_none() {
             bail!("origin.endpoint must include a host");
         }
+        if let Some(cluster) = &self.cluster {
+            cluster.membership()?;
+            let node_block = self.buckets.namespace()?.block_size.bytes();
+            let cluster_block = cluster.config()?.block_size.bytes();
+            if cluster_block % node_block != 0 {
+                bail!(
+                    "cluster.block_size ({cluster_block}) must be a multiple of buckets.block_size ({node_block})"
+                );
+            }
+        }
         if !self.server.listen.ip().is_loopback()
             && self.server.tls.is_none()
             && matches!(self.auth, AuthMode::Anonymous)
@@ -58,6 +71,7 @@ impl Config {
     pub fn s3(&self) -> Result<S3Config, Report> {
         Ok(S3Config {
             origin: self.origin.build()?,
+            origins: None,
             auth: Auth::from(&self.auth),
             addressing: Addressing::from(&self.server.addressing),
             buckets: self.buckets.namespace()?,
@@ -364,6 +378,94 @@ impl Buckets {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Cluster {
+    pub nodes: Vec<SocketAddr>,
+    pub dns: Option<String>,
+    #[serde(with = "humantime_serde")]
+    pub refresh: Duration,
+    pub block_size: Byte,
+    pub read_window: u32,
+    pub load_limit: usize,
+    #[serde(with = "humantime_serde")]
+    pub down_for: Duration,
+    pub hedge: Option<HedgeConfig>,
+    pub tls: bool,
+    pub credentials: Option<ClusterCredentials>,
+    pub warm_on_write: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterCredentials {
+    pub access_key: String,
+    pub secret_key: String,
+}
+
+impl Default for Cluster {
+    fn default() -> Self {
+        let defaults = ClusterConfig::default();
+        Self {
+            nodes: Vec::new(),
+            dns: None,
+            refresh: Duration::from_secs(10),
+            block_size: Byte::from_u64(defaults.block_size.bytes()),
+            read_window: defaults.read_window,
+            load_limit: defaults.load_limit,
+            down_for: defaults.down_for,
+            hedge: defaults.hedge,
+            tls: defaults.tls,
+            credentials: None,
+            warm_on_write: false,
+        }
+    }
+}
+
+impl Cluster {
+    pub fn membership(&self) -> Result<Membership, Report> {
+        match (&self.dns, self.nodes.is_empty()) {
+            (Some(_), false) => bail!("cluster.nodes and cluster.dns are mutually exclusive"),
+            (None, true) => bail!("cluster requires either cluster.nodes or cluster.dns"),
+            (None, false) => Ok(Membership::Static(self.nodes.clone())),
+            (Some(dns), true) => {
+                let (host, port) = dns
+                    .rsplit_once(':')
+                    .ok_or_else(|| eyre::eyre!("cluster.dns must be host:port"))?;
+                let port = port
+                    .parse()
+                    .wrap_err_with(|| format!("cluster.dns has an invalid port: {port}"))?;
+                Ok(Membership::dns(host, port).refresh(self.refresh))
+            }
+        }
+    }
+
+    pub fn config(&self) -> Result<ClusterConfig, Report> {
+        let block_size = u32::try_from(self.block_size.as_u64())
+            .ok()
+            .and_then(BlockSize::new)
+            .ok_or_else(|| {
+                eyre::eyre!(
+                    "cluster.block_size must be a power of two between {} and {} bytes",
+                    nestor::MIN_BLOCK_SIZE,
+                    nestor::MAX_BLOCK_SIZE
+                )
+            })?;
+        Ok(ClusterConfig {
+            block_size,
+            read_window: self.read_window,
+            load_limit: self.load_limit,
+            down_for: self.down_for,
+            hedge: self.hedge,
+            tls: self.tls,
+            credentials: self.credentials.as_ref().map(|c| Credentials {
+                access_key: c.access_key.clone(),
+                secret_key: c.secret_key.clone(),
+            }),
+        })
+    }
+}
+
 fn bytes(value: Byte, field: &str) -> Result<usize, Report> {
     usize::try_from(value.as_u64()).wrap_err_with(|| format!("{field} does not fit in usize"))
 }
@@ -457,6 +559,54 @@ mod tests {
                 }
             );
             assert_eq!(namespace.hedge.unwrap().min, Duration::from_millis(20));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn parses_cluster_and_checks_block_alignment() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "cluster.toml",
+                r#"
+                [buckets]
+                block_size = "1 MiB"
+
+                [cluster]
+                dns = "nestor.cache.svc:9000"
+                refresh = "5s"
+                block_size = "4 MiB"
+                load_limit = 32
+                credentials = { access_key = "ak", secret_key = "sk" }
+                warm_on_write = true
+                "#,
+            )?;
+            let config = Config::load(Some(Path::new("cluster.toml"))).unwrap();
+            config.validate().unwrap();
+            let cluster = config.cluster.as_ref().unwrap();
+            assert_eq!(
+                cluster.membership().unwrap(),
+                Membership::dns("nestor.cache.svc", 9000).refresh(Duration::from_secs(5))
+            );
+            let built = cluster.config().unwrap();
+            assert_eq!(built.block_size.bytes(), 4 * 1024 * 1024);
+            assert_eq!(built.load_limit, 32);
+            assert!(built.credentials.is_some());
+            assert!(cluster.warm_on_write);
+
+            jail.create_file(
+                "misaligned.toml",
+                "[buckets]\nblock_size = \"4 MiB\"\n[cluster]\nnodes = [\"10.0.0.1:9000\"]\nblock_size = \"1 MiB\"\n",
+            )?;
+            let config = Config::load(Some(Path::new("misaligned.toml"))).unwrap();
+            assert!(config.validate().is_err());
+
+            jail.create_file(
+                "both.toml",
+                "[cluster]\nnodes = [\"10.0.0.1:9000\"]\ndns = \"a:1\"\n",
+            )?;
+            let config = Config::load(Some(Path::new("both.toml"))).unwrap();
+            assert!(config.validate().is_err());
             Ok(())
         });
     }

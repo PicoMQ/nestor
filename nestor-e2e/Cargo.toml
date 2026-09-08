@@ -1,0 +1,40 @@
+[package]
+name = "nestor-e2e"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "End to end scenarios for nestor against RustFS: single node, cluster and embedded library"
+repository.workspace = true
+publish = false
+
+[dependencies]
+nestor = { workspace = true }
+nestor-store = { workspace = true }
+nestor-client = { workspace = true }
+
+object_store = { workspace = true, features = ["aws"] }
+reqwest = { workspace = true }
+
+async-trait = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["process", "fs"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[[test]]
+name = "single"
+path = "single/test.rs"
+
+[[test]]
+name = "cluster"
+path = "cluster/test.rs"
+
+[[test]]
+name = "library"
+path = "library/test.rs"
+
+[lints]
+workspace = true

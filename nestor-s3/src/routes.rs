@@ -9,7 +9,7 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use chrono::Utc;
 use futures::TryStreamExt;
-use http::header::{CONTENT_RANGE, CONTENT_TYPE, ETAG, HeaderValue};
+use http::header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, HeaderMap, HeaderValue};
 use http::request::Parts;
 use http::{Method, StatusCode};
 use nestor::{NamespaceId, Precondition, ReadRange};
@@ -161,6 +161,7 @@ async fn forward(
 ) -> Result<Response, S3Error> {
     let copy = req.headers().contains_key("x-amz-copy-source");
     let mutation = classify(req.method(), &target, raw_query, copy);
+    let payload_size = payload_size(req.headers());
     let capture = match mutation {
         Mutation::PutObject if !copy => service.populate_max,
         Mutation::DeleteObjects => Some(DELETE_OBJECTS_MAX_BODY),
@@ -187,6 +188,11 @@ async fn forward(
             {
                 populate(nestor, ns, key, &response, &data);
             }
+            if let Some(size) = payload_size
+                && let Some(bucket) = &target.bucket
+            {
+                service.origins.written(bucket, key, size);
+            }
         }
         Mutation::DeleteObject | Mutation::CompleteMultipart => {
             let key = target.key.as_deref().expect("classified with key");
@@ -203,6 +209,14 @@ async fn forward(
         }
     }
     Ok(response)
+}
+
+fn payload_size(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get("x-amz-decoded-content-length")
+        .or_else(|| headers.get(CONTENT_LENGTH))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
 }
 
 fn populate(

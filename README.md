@@ -78,5 +78,5 @@ let cached: Arc<dyn ObjectStore> = Arc::new(nestor_store::NestorStore::new(nesto
 cargo test --workspace
 cargo bench -p nestor
 
-./scripts/e2e-minio.sh    # MinIO container plus the aws cli, needs docker
+./nestor-e2e/e2e.sh       # single node, cluster and library scenarios against RustFS, needs docker
 ```

@@ -64,6 +64,7 @@ async fn setup(auth: Auth, populate: Option<usize>) -> (MockServer, Router, Nest
             "origin-sk",
             None,
         ),
+        origins: None,
         auth,
         addressing: Addressing::Path,
         buckets: nestor::NamespaceConfig::default()

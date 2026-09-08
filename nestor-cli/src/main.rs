@@ -1,5 +1,6 @@
 //! The `nestor` binary. `serve` runs the S3 frontend, `check` validates a configuration.
 
+mod cluster;
 mod config;
 mod serve;
 mod telemetry;

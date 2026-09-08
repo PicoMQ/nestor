@@ -12,21 +12,36 @@ use crate::addressing::Addressing;
 use crate::auth::Auth;
 use crate::error::S3Error;
 use crate::forward::Forwarder;
-use crate::origin::OriginConfig;
+use crate::origin::{OriginConfig, Origins};
 use crate::routes;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct S3Config {
     pub origin: OriginConfig,
+    pub origins: Option<Arc<dyn Origins>>,
     pub auth: Auth,
     pub addressing: Addressing,
     pub buckets: NamespaceConfig,
     pub populate_max: Option<usize>,
 }
 
+impl std::fmt::Debug for S3Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Config")
+            .field("origin", &self.origin)
+            .field("origins", &self.origins.is_some())
+            .field("auth", &self.auth)
+            .field("addressing", &self.addressing)
+            .field("buckets", &self.buckets)
+            .field("populate_max", &self.populate_max)
+            .finish()
+    }
+}
+
 pub struct S3Service {
     pub(crate) nestor: Nestor,
     pub(crate) forwarder: Forwarder,
+    pub(crate) origins: Arc<dyn Origins>,
     pub(crate) auth: Auth,
     pub(crate) addressing: Addressing,
     pub(crate) populate_max: Option<usize>,
@@ -36,9 +51,13 @@ pub struct S3Service {
 
 impl S3Service {
     pub fn new(nestor: Nestor, config: S3Config) -> Arc<Self> {
+        let origins = config
+            .origins
+            .unwrap_or_else(|| Arc::new(config.origin.clone()));
         Arc::new(Self {
             nestor,
             forwarder: Forwarder::new(config.origin),
+            origins,
             auth: config.auth,
             addressing: config.addressing,
             populate_max: config.populate_max,
@@ -67,7 +86,7 @@ impl S3Service {
         {
             return Ok(*id);
         }
-        let origin = self.forwarder.origin().bucket_origin(bucket)?;
+        let origin = self.origins.origin(bucket)?;
         let id = self
             .nestor
             .register(Namespace::new(bucket, origin).config(self.buckets));

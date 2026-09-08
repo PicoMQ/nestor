@@ -1,0 +1,32 @@
+[package]
+name = "nestor-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Client side routing across a cluster of nestor nodes with rendezvous hashing and bounded load"
+repository.workspace = true
+
+[dependencies]
+nestor = { workspace = true }
+nestor-store = { workspace = true }
+
+object_store = { workspace = true, features = ["aws"] }
+
+ahash = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net", "time"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+nestor-s3 = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+http = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "net"] }
+
+[lints]
+workspace = true
