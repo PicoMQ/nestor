@@ -136,13 +136,24 @@ pub async fn build(
         .with_recover_mode(disk.recover)
         .with_compression(disk.compression);
 
-    #[cfg(target_os = "linux")]
-    let io_engine: Box<dyn foyer::IoEngineConfig> = Box::new(foyer::UringIoEngineConfig::new());
-    #[cfg(not(target_os = "linux"))]
-    let io_engine: Box<dyn foyer::IoEngineConfig> = Box::new(foyer::PsyncIoEngineConfig::new());
-    let storage = storage.with_io_engine_config(io_engine);
+    storage.with_io_engine_config(io_engine()).build().await
+}
 
-    storage.build().await
+/// io_uring when the kernel and the container's seccomp profile allow it, psync otherwise.
+#[cfg(target_os = "linux")]
+fn io_engine() -> Box<dyn foyer::IoEngineConfig> {
+    match io_uring::IoUring::new(2) {
+        Ok(_) => Box::new(foyer::UringIoEngineConfig::new()),
+        Err(e) => {
+            tracing::warn!(error = %e, "io_uring unavailable, disk tier uses psync");
+            Box::new(foyer::PsyncIoEngineConfig::new())
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn io_engine() -> Box<dyn foyer::IoEngineConfig> {
+    Box::new(foyer::PsyncIoEngineConfig::new())
 }
 
 pub(crate) type ObjectCache<V> = Cache<ObjectKey, V, ahash::RandomState, CacheProperties>;

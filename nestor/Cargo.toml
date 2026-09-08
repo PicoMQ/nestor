@@ -38,3 +38,6 @@ harness = false
 
 [lints]
 workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"

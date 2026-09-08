@@ -1830,6 +1830,7 @@ dependencies = [
  "foyer",
  "futures",
  "humantime-serde",
+ "io-uring",
  "metrics",
  "mixtrics",
  "pin-project-lite",
