@@ -116,8 +116,8 @@ html {
 
 :root {
   --kakapo-nav-edge: 24px;
-  --kakapo-bird-w: min(43vw, 30rem);
-  --kakapo-bird-h: calc(100vh - var(--vp-nav-height) - 3rem);
+  --kakapo-bird-w: min(39vw, 27rem);
+  --kakapo-bird-h: calc(90vh - var(--vp-nav-height) - 3rem);
 }
 
 @media (min-width: 768px) {
@@ -195,8 +195,8 @@ html {
   position: fixed !important;
   z-index: 0;
   pointer-events: none;
-  top: calc(var(--vp-nav-height) - 2rem);
-  right: calc(var(--kakapo-nav-edge) + 4rem);
+  top: calc(var(--vp-nav-height) + 1rem);
+  right: calc(var(--kakapo-nav-edge) + 6rem);
   width: var(--kakapo-bird-w);
   height: var(--kakapo-bird-h);
   background-image: url("/images/strigops.webp");
@@ -245,8 +245,8 @@ html {
 
 @media (max-width: 959px) {
   :root {
-    --kakapo-bird-w: min(52vw, 20rem);
-    --kakapo-bird-h: calc(100vh - var(--vp-nav-height) - 1rem);
+    --kakapo-bird-w: min(47vw, 18rem);
+    --kakapo-bird-h: calc(90vh - var(--vp-nav-height) - 1rem);
   }
 
   .kakapo-bird-reveal {
@@ -276,7 +276,7 @@ html {
   right: var(--kakapo-nav-edge);
   top: calc(var(--vp-nav-height) + 3rem);
   margin: 0;
-  max-width: min(12rem, calc(var(--kakapo-bird-w) * 0.4));
+  max-width: min(16rem, calc(var(--kakapo-bird-w) * 0.55));
   padding: 0.4rem 0.6rem;
   font-family: var(--kakapo-font-serif);
   font-size: 0.8125rem;

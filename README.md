@@ -2,7 +2,7 @@
 
 Nestor is a read-through block cache for S3-compatible object storage, in RAM and on local disk.
 
-The documentation is in [`website/`](website/pages/docs/index.md) and published from it. Design, configuration, deployment and the library API are covered there.
+[Documentation](https://nestor.picomq.com/docs/) · [Discord](https://discord.gg/qsMy5sSpYX) · [Quick start](https://nestor.picomq.com/docs/quick-start)
 
 ## Install
 
