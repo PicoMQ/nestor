@@ -4,7 +4,50 @@ const docsSidebar = [
   {
     text: 'Getting started',
     collapsed: false,
-    items: [{ text: 'Introduction', link: '/docs/' }],
+    items: [
+      { text: 'Introduction', link: '/docs/' },
+      { text: 'Quick start', link: '/docs/quick-start' },
+    ],
+  },
+  {
+    text: 'Design',
+    collapsed: false,
+    items: [
+      { text: 'Overview', link: '/docs/design/overview' },
+      { text: 'Blocks & reads', link: '/docs/design/reads' },
+      { text: 'Origin fetches', link: '/docs/design/fetches' },
+      { text: 'Consistency', link: '/docs/design/consistency' },
+      { text: 'Cache tiers', link: '/docs/design/tiers' },
+      { text: 'S3 endpoint', link: '/docs/design/endpoint' },
+      { text: 'Cluster', link: '/docs/design/cluster' },
+    ],
+  },
+  {
+    text: 'Operations',
+    collapsed: true,
+    items: [
+      { text: 'Configuration', link: '/docs/operations/configuration' },
+      { text: 'Deployment', link: '/docs/operations/deployment' },
+      { text: 'Metrics', link: '/docs/operations/metrics' },
+      { text: 'Tuning', link: '/docs/operations/tuning' },
+    ],
+  },
+  {
+    text: 'Library',
+    collapsed: true,
+    items: [
+      { text: 'nestor', link: '/docs/library/nestor' },
+      { text: 'nestor-store', link: '/docs/library/store' },
+      { text: 'nestor-client', link: '/docs/library/client' },
+    ],
+  },
+  {
+    text: 'Community',
+    collapsed: true,
+    items: [
+      { text: 'Contribute', link: '/docs/contribute' },
+      { text: 'Discord', link: 'https://discord.gg/qsMy5sSpYX' },
+    ],
   },
 ];
 
@@ -47,6 +90,8 @@ export default defineConfig({
     siteTitle: false,
     nav: [
       { text: 'Docs', link: '/docs' },
+      { text: 'Contribute', link: '/docs/contribute' },
+      { text: 'Discord', link: 'https://discord.gg/qsMy5sSpYX' },
       { text: 'GitHub', link: 'https://github.com/picomq/nestor' },
     ],
     sidebar: docsSidebar,
