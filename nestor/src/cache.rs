@@ -139,7 +139,7 @@ pub async fn build(
     storage.with_io_engine_config(io_engine()).build().await
 }
 
-/// io_uring when the kernel and the container's seccomp profile allow it, psync otherwise.
+/// `io_uring` when the kernel and seccomp profile allow it, `psync` otherwise.
 #[cfg(target_os = "linux")]
 fn io_engine() -> Box<dyn foyer::IoEngineConfig> {
     match io_uring::IoUring::new(2) {
