@@ -65,7 +65,6 @@ mimalloc = "0.1.52"
 
 proptest = "1.11.0"
 tempfile = "3.27.0"
-criterion = { version = "0.8.2", features = ["async_tokio"] }
 wiremock = "0.6.5"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
 tower = { version = "0.5.2", features = ["util"] }

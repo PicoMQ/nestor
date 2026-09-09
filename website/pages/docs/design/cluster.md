@@ -55,7 +55,7 @@ Each node has a `load_limit` of in-flight requests from a given client, `256` by
 
 A node whose connection fails is marked down for `down_for`, `5` s by default, and skipped in every ranking until then. The request that observed the failure is retried once on the next ranked node. Application-level errors such as `404` or `412` are answers and are not failed over.
 
-Hedging works across nodes. Each node keeps a latency estimate, and a request that has not answered after `factor` times that estimate is duplicated to the second ranked node, the first answer wins. The defaults are the same as the engine's, see [Origin fetches](/docs/design/fetches).
+Hedging works across nodes. Each node keeps the same latency histogram a namespace does, and a request that has not answered after the hedge delay is duplicated to the second ranked node, the first answer wins. A connection failure on either side while the other is in flight hands over to it. The rule and the defaults are the engine's, see [Hedging](/docs/design/fetches#hedging).
 
 ## Membership
 

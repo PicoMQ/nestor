@@ -3,11 +3,13 @@
 //! fetched from the namespace's `Origin`.
 
 pub mod block;
+mod body;
 pub mod cache;
 pub mod error;
 mod fetch;
 mod inflight;
 pub mod key;
+pub mod latency;
 pub mod memory;
 mod meta;
 pub mod metrics;
@@ -19,15 +21,17 @@ mod readahead;
 mod reader;
 
 pub use block::{BlockSize, MAX_BLOCK_SIZE, MIN_BLOCK_SIZE, ReadRange};
-pub use cache::{CacheConfig, DiskConfig};
+pub use cache::{CacheConfig, DiskConfig, DiskIo};
 pub use error::{NestorError, OriginError, Result};
-pub use fetch::Latency;
 pub use foyer::{Compression, RecoverMode};
 pub use key::NamespaceId;
+pub use latency::Latency;
 pub use memory::MemoryOrigin;
 pub use mixtrics::metrics::BoxedRegistry;
 pub use namespace::{Consistency, Namespace, NamespaceConfig};
 pub use nestor::{Nestor, NestorBuilder, ReadOptions};
 pub use origin::{GetOptions, GetResponse, ObjectMeta, Origin, Precondition, Preconditions};
-pub use policy::{FetchOverrides, FetchPolicy, HedgeConfig, PolicyParseError};
+pub use policy::{
+    FetchOverrides, FetchPolicy, HedgeAfter, HedgeConfig, HedgeConfigError, PolicyParseError,
+};
 pub use reader::ReadStream;

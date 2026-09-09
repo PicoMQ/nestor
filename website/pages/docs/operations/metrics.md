@@ -9,7 +9,7 @@ metrics = "0.0.0.0:9100"
 
 ## Engine
 
-Every series carries a `namespace` label. In the S3 endpoint that is the bucket name.
+Every series carries a `namespace` label. In the S3 endpoint that is the bucket name. Hedge series also carry `phase`, `headers` or `body`, see [Hedging](/docs/design/fetches#hedging).
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
@@ -23,8 +23,10 @@ Every series carries a `namespace` label. In the S3 endpoint that is the bucket 
 | `nestor_origin_retries_total` | counter | Retries issued. |
 | `nestor_origin_timeouts_total` | counter | Attempts cut off by `first_byte` or `attempt`. |
 | `nestor_origin_ttfb_seconds` | histogram | Time to first byte per origin `GET`. |
-| `nestor_hedges_total` | counter | Secondary requests issued. |
-| `nestor_hedge_wins_total` | counter | Secondary requests that answered before the primary. |
+| `nestor_origin_block_seconds` | histogram | Time per block once headers have arrived. |
+| `nestor_hedges_total` | counter | Secondary requests issued, by `phase`. |
+| `nestor_hedge_wins_total` | counter | Secondary requests that won, by `phase`. |
+| `nestor_hedge_delay_seconds` | gauge | Hedge delay the latency window last produced, by `phase`. |
 | `nestor_readahead_blocks_total` | counter | Blocks scheduled by readahead. |
 | `nestor_meta_heads_total` | counter | `HEAD` requests to the origin. |
 | `nestor_bytes_served_total` | counter | Bytes returned to callers. |
@@ -33,7 +35,7 @@ The ratios that matter:
 
 - **Hit ratio** is `hit / (hit + miss + joined)`. `joined` counts as neither a hit nor an origin request, it is the coalescing at work. A high `joined` share means many readers on the same cold data.
 - **Bytes amplification** is `origin_bytes / bytes_served`. Above `1` for random small reads because whole blocks are fetched, well below `1` once the cache is warm. Persistently above `1` on a warm cache suggests the block size is too large for the access pattern.
-- **Hedge effectiveness** is `hedge_wins / hedges`. Near zero means the hedge delay is too short, hedges fire but the primary still wins. Near one means the origin has a real tail and hedging is paying for itself.
+- **Hedge effectiveness** is `hedge_wins / hedges`, per phase. Near zero means the hedge delay is too short, hedges fire but the primary still wins. Near one means the origin has a real tail and hedging is paying for itself. `hedge_delay` shows the delay in force, pinned at `max` means the window is empty or the origin is slower than `max`. A high `body` hedge rate with few wins means `min` is below the origin's normal time per block.
 - **`meta_heads`** should stay near zero. Cold reads learn metadata from their first `GET`, so a rising count means suffix reads on cold objects or `HEAD` requests from clients.
 
 ## Tiers

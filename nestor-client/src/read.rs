@@ -141,16 +141,22 @@ impl Cluster {
         let result = match &self.config().hedge {
             None => first.await,
             Some(hedge) => {
-                let delay = hedge.delay(primary_node.latency().get());
+                let delay = hedge.delay(primary_node.latency());
                 tokio::select! {
                     result = &mut first => result,
                     () = tokio::time::sleep(delay) => match ranked.secondary(&primary_node) {
                         None => first.await,
                         Some(secondary) => {
-                            let second = self.attempt(secondary, bucket, &request);
+                            let mut second = std::pin::pin!(self.attempt(secondary, bucket, &request));
                             tokio::select! {
-                                result = &mut first => result,
-                                result = second => result,
+                                result = &mut first => match result {
+                                    Err(OriginError::Io(_)) => second.await,
+                                    result => result,
+                                },
+                                result = &mut second => match result {
+                                    Err(OriginError::Io(_)) => first.await,
+                                    result => result,
+                                },
                             }
                         }
                     },

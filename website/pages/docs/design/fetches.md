@@ -78,7 +78,44 @@ A timeout is `OriginError::Timeout` and retryable. Blocks are inserted only once
 
 ### Hedging
 
-Time to first byte is tracked per namespace as an EWMA. A request unanswered after `factor` times that average, clamped to `[min, max]`, gets a second identical request and the first answer wins. A `20` ms origin hedges at `60` ms. Before any observation the delay is `max`. The cluster client additionally hedges across nodes, see [Cluster](/docs/design/cluster).
+<div class="kakapo-diagram">
+<svg viewBox="0 0 720 250" width="720" role="img" aria-label="Timeline of one attempt. The primary stream returns headers and blocks 0 to 2, then stalls on block 3. One hedge delay later a backup request opens for blocks 3 to 6, delivers block 3 first and carries on while the primary is dropped.">
+  <defs>
+    <marker id="arrh" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0.5 L7.5 4 L0 7.5 Z" class="arrow"/>
+    </marker>
+  </defs>
+  <text x="20" y="66" class="label">primary</text>
+  <rect x="90" y="46" width="90" height="34" class="box"/>
+  <text x="135" y="68" text-anchor="middle" class="sub">headers</text>
+  <rect x="180" y="46" width="70" height="34" class="box"/>
+  <text x="215" y="68" text-anchor="middle" class="sub">block 0</text>
+  <rect x="250" y="46" width="70" height="34" class="box"/>
+  <text x="285" y="68" text-anchor="middle" class="sub">block 1</text>
+  <rect x="320" y="46" width="70" height="34" class="box"/>
+  <text x="355" y="68" text-anchor="middle" class="sub">block 2</text>
+  <rect x="390" y="46" width="230" height="34" class="box-accent"/>
+  <text x="545" y="68" text-anchor="middle" class="sub">block 3, stalled, dropped</text>
+  <path d="M470 34 L470 186" class="edge-soft"/>
+  <text x="470" y="26" text-anchor="middle" class="sub">hedge delay after block 2</text>
+  <text x="20" y="156" class="label">backup</text>
+  <rect x="470" y="136" width="70" height="34" class="box"/>
+  <text x="505" y="158" text-anchor="middle" class="sub">headers</text>
+  <rect x="540" y="136" width="70" height="34" class="box"/>
+  <text x="575" y="158" text-anchor="middle" class="sub">block 3</text>
+  <rect x="610" y="136" width="70" height="34" class="box"/>
+  <text x="645" y="158" text-anchor="middle" class="sub">block 4</text>
+  <text x="470" y="192" class="sub">GET blocks 3..6, the range still owed</text>
+  <path d="M90 220 L700 220" class="edge" marker-end="url(#arrh)"/>
+  <text x="90" y="238" class="sub">time</text>
+</svg>
+</div>
+
+An attempt has two stages and each is hedged against its own distribution. Each namespace keeps two histograms over the last one to two minutes, time to first byte and time per block, the latter measured from headers or from the previous block to the next complete block on whichever stream delivered it. They are log2 histograms with eight sub-buckets per octave, updated with atomic increments and rotated in three generations, so a quantile read is a walk over `192` counters and never below the true value by construction, at most `12.5%` above it.
+
+The hedge delay is either `factor` times the mean, `3.0` by default so a `20` ms origin hedges at `60` ms, or the `quantile` of the window, `{ quantile = 0.99 }` hedges at the recent p99. Exactly one of the two is set. Either way the delay is clamped to `[min, max]`, and with no sample in the window it is `max`. The delay in force per stage is exported as `nestor_hedge_delay_seconds`.
+
+Headers unanswered after the delay get a second identical request and the first answer wins. A block that has not completed after the delay gets a second request for the range still owed, from the first unfinished block to the end of the fetch, and the first stream to complete the next block carries on while the other is dropped. Nothing already delivered is fetched twice. In both stages a retryable failure on one side hands over to the other, so a hedge already in flight is used rather than backed off and retried. A backup whose `ETag` no longer matches is dropped, the primary is still the version the read started on. The cluster client hedges across nodes with the same rule, see [Cluster](/docs/design/cluster).
 
 ### Retries
 

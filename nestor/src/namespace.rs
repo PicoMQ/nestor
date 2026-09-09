@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::block::BlockSize;
-use crate::fetch::Latency;
 use crate::key::NamespaceId;
+use crate::latency::Latency;
 use crate::metrics::NamespaceMetrics;
 use crate::origin::Origin;
 use crate::policy::FetchPolicy;
@@ -161,7 +161,8 @@ pub(crate) struct NamespaceState {
     pub name: Arc<str>,
     pub origin: Arc<dyn Origin>,
     pub config: NamespaceConfig,
-    pub latency: Latency,
+    pub ttfb: Latency,
+    pub block: Latency,
     pub metrics: NamespaceMetrics,
 }
 
@@ -173,7 +174,8 @@ impl NamespaceState {
             name: namespace.name,
             origin: namespace.origin,
             config: namespace.config,
-            latency: Latency::default(),
+            ttfb: Latency::default(),
+            block: Latency::default(),
             metrics,
         }
     }
