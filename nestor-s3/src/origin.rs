@@ -88,11 +88,30 @@ impl OriginConfig {
         self.endpoint.authority()
     }
 
+    pub(crate) fn bucket_host(&self, bucket: &str) -> Result<String, S3Error> {
+        let authority = self
+            .authority()
+            .ok_or_else(|| S3Error::internal("origin endpoint has no authority"))?;
+        if self.virtual_hosted {
+            Ok(format!("{bucket}.{authority}"))
+        } else {
+            Ok(authority.to_string())
+        }
+    }
+
+    fn object_store_endpoint(&self, bucket: &str) -> Result<String, S3Error> {
+        if self.virtual_hosted {
+            Ok(format!("{}://{}", self.scheme(), self.bucket_host(bucket)?))
+        } else {
+            Ok(self.endpoint.to_string().trim_end_matches('/').to_string())
+        }
+    }
+
     fn bucket_origin(&self, bucket: &str) -> Result<Arc<dyn Origin>, S3Error> {
         let mut builder = AmazonS3Builder::new()
             .with_bucket_name(bucket)
             .with_region(self.region.clone())
-            .with_endpoint(self.endpoint.to_string().trim_end_matches('/'))
+            .with_endpoint(self.object_store_endpoint(bucket)?)
             .with_client_options(self.transport.client_options())
             .with_retry(self.transport.retry_config())
             .with_virtual_hosted_style_request(self.virtual_hosted);
@@ -116,5 +135,40 @@ impl std::fmt::Debug for OriginConfig {
             .field("virtual_hosted", &self.virtual_hosted)
             .field("transport", &self.transport)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn aws() -> OriginConfig {
+        OriginConfig::anonymous(
+            "https://s3.us-east-1.amazonaws.com".parse().unwrap(),
+            "us-east-1",
+        )
+    }
+
+    #[test]
+    fn object_store_endpoint_prefixes_bucket_when_virtual_hosted() {
+        let config = aws().with_virtual_hosted(true);
+        assert_eq!(
+            config.object_store_endpoint("photos").unwrap(),
+            "https://photos.s3.us-east-1.amazonaws.com"
+        );
+        assert_eq!(
+            config.bucket_host("photos").unwrap(),
+            "photos.s3.us-east-1.amazonaws.com"
+        );
+    }
+
+    #[test]
+    fn object_store_endpoint_keeps_path_style_endpoint() {
+        let config = OriginConfig::anonymous("http://minio:9000".parse().unwrap(), "us-east-1");
+        assert_eq!(
+            config.object_store_endpoint("photos").unwrap(),
+            "http://minio:9000"
+        );
+        assert_eq!(config.bucket_host("photos").unwrap(), "minio:9000");
     }
 }
