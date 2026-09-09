@@ -5,10 +5,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::block::BlockSize;
-use crate::fetch::{HedgeConfig, Latency};
+use crate::fetch::Latency;
 use crate::key::NamespaceId;
 use crate::metrics::NamespaceMetrics;
 use crate::origin::Origin;
+use crate::policy::FetchPolicy;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(
@@ -40,14 +41,11 @@ impl Consistency {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NamespaceConfig {
     pub block_size: BlockSize,
-    /// Max contiguous blocks per origin GET.
     pub fetch_window: u32,
-    /// Blocks in flight per stream.
     pub read_window: u32,
     pub consistency: Consistency,
-    /// Blocks prefetched after a sequential read, 0 disables.
     pub readahead: u32,
-    pub hedge: Option<HedgeConfig>,
+    pub fetch: FetchPolicy,
 }
 
 impl Default for NamespaceConfig {
@@ -60,7 +58,7 @@ impl Default for NamespaceConfig {
                 ttl: Duration::from_secs(60),
             },
             readahead: 8,
-            hedge: Some(HedgeConfig::default()),
+            fetch: FetchPolicy::default(),
         }
     }
 }
@@ -91,8 +89,8 @@ impl NamespaceConfig {
         self
     }
 
-    pub fn hedge(mut self, hedge: Option<HedgeConfig>) -> Self {
-        self.hedge = hedge;
+    pub fn fetch(mut self, policy: FetchPolicy) -> Self {
+        self.fetch = policy;
         self
     }
 }
@@ -143,8 +141,8 @@ impl Namespace {
         self
     }
 
-    pub fn hedge(mut self, hedge: Option<HedgeConfig>) -> Self {
-        self.config = self.config.hedge(hedge);
+    pub fn fetch(mut self, policy: FetchPolicy) -> Self {
+        self.config = self.config.fetch(policy);
         self
     }
 }

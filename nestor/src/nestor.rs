@@ -12,11 +12,12 @@ use mixtrics::metrics::BoxedRegistry;
 use crate::block::ReadRange;
 use crate::cache::{self, CacheConfig};
 use crate::error::{NestorError, Result};
-use crate::fetch::{Fetcher, Priority, ReadCtx, RetryConfig};
-use crate::key::{BlockKey, IMMUTABLE_TAG, NamespaceId, ObjectKey, block_tag};
+use crate::fetch::{Fetcher, Priority, ReadCtx};
+use crate::key::{Block, BlockKey, IMMUTABLE_TAG, NamespaceId, ObjectKey, block_tag};
 use crate::meta::{MetaCache, MetaLookup};
 use crate::namespace::{Namespace, NamespaceState};
 use crate::origin::ObjectMeta;
+use crate::policy::{FetchOverrides, FetchPolicy};
 use crate::readahead::Readahead;
 use crate::reader::{ReadStream, Reader};
 
@@ -45,13 +46,12 @@ impl Engine {
             .ok_or(NestorError::UnknownNamespace)
     }
 
-    /// Everything a read needs before its first block. Served from the metadata cache when fresh,
-    /// otherwise learned from the read's own first GET. Only suffix ranges still need a HEAD.
     pub(crate) async fn resolve_ctx(
         &self,
         ns: &Arc<NamespaceState>,
         name: &Arc<str>,
         request: &ReadRange,
+        policy: FetchPolicy,
     ) -> Result<Arc<ReadCtx>> {
         let key = ObjectKey::new(ns.id, name);
         let stale = match self.meta.lookup(&key, ns.meta_ttl()) {
@@ -61,17 +61,24 @@ impl Engine {
                     key,
                     Arc::clone(name),
                     Some(meta),
+                    policy,
                 ));
             }
             MetaLookup::Stale(meta) => Some(meta),
             MetaLookup::Missing => None,
         };
         if ns.config.consistency.is_immutable() && !request.needs_size() {
-            return Ok(ReadCtx::new(Arc::clone(ns), key, Arc::clone(name), None));
+            return Ok(ReadCtx::new(
+                Arc::clone(ns),
+                key,
+                Arc::clone(name),
+                None,
+                policy,
+            ));
         }
         let window = ns.config.fetch_window;
         if let Some(indexes) = ns.config.block_size.first_group(request, window) {
-            return self.fetcher.probe(ns, name, indexes, stale).await;
+            return self.fetcher.probe(ns, name, indexes, stale, policy).await;
         }
         let meta = self.fetcher.head(ns, &key, name).await?;
         Ok(ReadCtx::new(
@@ -79,6 +86,7 @@ impl Engine {
             key,
             Arc::clone(name),
             Some(meta),
+            policy,
         ))
     }
 }
@@ -88,13 +96,32 @@ pub struct Nestor {
     engine: Arc<Engine>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReadOptions {
+    pub range: ReadRange,
+    pub fetch: FetchOverrides,
+}
+
+impl ReadOptions {
+    pub fn range(range: impl Into<ReadRange>) -> Self {
+        Self {
+            range: range.into(),
+            fetch: FetchOverrides::default(),
+        }
+    }
+
+    pub fn fetch(mut self, overrides: FetchOverrides) -> Self {
+        self.fetch = overrides;
+        self
+    }
+}
+
 pub struct NestorBuilder {
     cache: CacheConfig,
     namespaces: Vec<Namespace>,
     origin_concurrency: usize,
     readahead_concurrency: usize,
     hedge_concurrency: usize,
-    retry: RetryConfig,
     meta_capacity: usize,
     metrics: Option<BoxedRegistry>,
 }
@@ -107,7 +134,6 @@ impl NestorBuilder {
             origin_concurrency: 64,
             readahead_concurrency: 16,
             hedge_concurrency: 16,
-            retry: RetryConfig::default(),
             meta_capacity: 100_000,
             metrics: None,
         }
@@ -133,11 +159,6 @@ impl NestorBuilder {
         self
     }
 
-    pub fn retry(mut self, retry: RetryConfig) -> Self {
-        self.retry = retry;
-        self
-    }
-
     pub fn meta_capacity(mut self, entries: usize) -> Self {
         self.meta_capacity = entries;
         self
@@ -157,7 +178,6 @@ impl NestorBuilder {
             self.origin_concurrency,
             self.readahead_concurrency,
             self.hedge_concurrency,
-            self.retry,
         );
         let engine = Arc::new(Engine {
             registry: RwLock::new(Registry::default()),
@@ -241,10 +261,26 @@ impl Nestor {
         object: &str,
         range: impl Into<ReadRange>,
     ) -> Result<ReadStream> {
+        self.get_opts(ns, object, ReadOptions::range(range)).await
+    }
+
+    pub async fn get_opts(
+        &self,
+        ns: NamespaceId,
+        object: &str,
+        options: ReadOptions,
+    ) -> Result<ReadStream> {
         let state = self.state(ns)?;
-        let request: ReadRange = range.into();
+        let ReadOptions {
+            range: request,
+            fetch,
+        } = options;
+        let policy = state.config.fetch.with(&fetch);
         let name: Arc<str> = Arc::from(object);
-        let ctx = self.engine.resolve_ctx(&state, &name, &request).await?;
+        let ctx = self
+            .engine
+            .resolve_ctx(&state, &name, &request, policy)
+            .await?;
         let range = match (ctx.size(), &request) {
             (Some(size), _) => request.resolve(size)?,
             (None, ReadRange::Bounded(r)) => {
@@ -308,7 +344,10 @@ impl Nestor {
         for index in 0..bs.count(meta.size) {
             let range = bs.block_range(index, Some(meta.size));
             let block = data.slice(range.start as usize..range.end as usize);
-            cache.insert(BlockKey::new(&key, tag, index), block);
+            cache.insert(
+                BlockKey::new(&key, tag, index),
+                Block::new(meta.clone(), block),
+            );
         }
         self.engine.meta.put(key, meta);
         Ok(())

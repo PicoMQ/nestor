@@ -7,6 +7,7 @@ members = [
     "nestor-cli",
     "nestor-client",
     "nestor-e2e",
+    "nestor-bench",
 ]
 
 [workspace.package]

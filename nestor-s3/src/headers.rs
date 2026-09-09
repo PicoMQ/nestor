@@ -5,10 +5,25 @@ use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
 use http::header::{
-    ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, ETAG, HeaderMap, HeaderValue, IF_MATCH,
-    IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_UNMODIFIED_SINCE, LAST_MODIFIED, RANGE,
+    ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, ETAG, HeaderMap, HeaderName, HeaderValue,
+    IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_UNMODIFIED_SINCE, LAST_MODIFIED, RANGE,
 };
-use nestor::{ObjectMeta, Preconditions, ReadRange};
+use nestor::{FetchOverrides, ObjectMeta, Preconditions, ReadRange};
+
+use crate::error::S3Error;
+
+pub const X_NESTOR_FETCH: HeaderName = HeaderName::from_static("x-nestor-fetch");
+
+pub fn fetch_overrides(headers: &HeaderMap) -> Result<FetchOverrides, S3Error> {
+    let Some(value) = headers.get(&X_NESTOR_FETCH) else {
+        return Ok(FetchOverrides::default());
+    };
+    let text = value
+        .to_str()
+        .map_err(|_| S3Error::invalid_request("x-nestor-fetch is not valid text"))?;
+    FetchOverrides::parse(text)
+        .map_err(|e| S3Error::invalid_request(format!("x-nestor-fetch: {e}")))
+}
 
 pub fn parse_range(headers: &HeaderMap) -> Option<ReadRange> {
     let value = headers.get(RANGE)?.to_str().ok()?.trim();
@@ -113,6 +128,16 @@ mod tests {
         assert_eq!(parsed.if_modified_since, Some(now));
         assert_eq!(parsed.if_unmodified_since, None);
         assert!(preconditions(&HeaderMap::new()).is_empty());
+    }
+
+    #[test]
+    fn fetch_overrides_from_header() {
+        let parsed = fetch_overrides(&headers(X_NESTOR_FETCH, "attempts=2 hedge=off")).unwrap();
+        assert_eq!(parsed.attempts, Some(2));
+        assert_eq!(parsed.hedge, Some(false));
+        assert!(fetch_overrides(&HeaderMap::new()).unwrap().is_empty());
+        let err = fetch_overrides(&headers(X_NESTOR_FETCH, "deadline=never")).unwrap_err();
+        assert_eq!(err.status, http::StatusCode::BAD_REQUEST);
     }
 
     #[test]

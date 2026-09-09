@@ -12,8 +12,8 @@ use bytes::Bytes;
 use futures::TryStreamExt;
 use http::Uri;
 use nestor::{
-    BlockSize, CacheConfig, GetOptions, GetResponse, HedgeConfig, Namespace, NamespaceConfig,
-    Nestor, ObjectMeta, Origin, OriginError, ReadRange,
+    BlockSize, CacheConfig, FetchPolicy, GetOptions, GetResponse, HedgeConfig, Namespace,
+    NamespaceConfig, Nestor, ObjectMeta, Origin, OriginError, ReadRange,
 };
 use nestor_client::{Cluster, ClusterConfig, ClusterOrigin, Membership};
 use nestor_s3::{Addressing, Auth, OriginConfig, Origins, S3Config, S3Error, S3Service};
@@ -105,7 +105,7 @@ impl Nodes {
                 addressing: Addressing::Path,
                 buckets: NamespaceConfig::default()
                     .block_size(BlockSize::new(BLOCK).unwrap())
-                    .hedge(None)
+                    .fetch(FetchPolicy::default().hedge(None))
                     .readahead(0),
                 populate_max: None,
             };
@@ -255,7 +255,7 @@ async fn local_nestor_reads_through_the_cluster() {
             Namespace::new(BUCKET, Arc::new(cluster_origin))
                 .block_size(BlockSize::new(BLOCK).unwrap())
                 .fetch_window(3)
-                .hedge(None),
+                .fetch(FetchPolicy::default().hedge(None)),
         )
         .build()
         .await

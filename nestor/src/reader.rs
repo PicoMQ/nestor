@@ -33,7 +33,6 @@ impl ReadStream {
         self.meta().map(|m| m.size)
     }
 
-    /// The requested range, clipped to the object once its size is known.
     pub fn range(&self) -> Range<u64> {
         match self.size() {
             Some(size) => self.range.start..self.range.end.min(size),
@@ -48,8 +47,6 @@ impl ReadStream {
         })
     }
 
-    /// Waits until the object's metadata is known, pulling the first chunk if that is what it
-    /// takes. The chunk is replayed by the stream afterwards.
     pub async fn ready(&mut self) -> Result<&ObjectMeta> {
         if self.known.get().is_none()
             && self.peeked.is_none()
@@ -108,16 +105,12 @@ pub(crate) struct Reader {
     request: ReadRange,
     ctx: Arc<ReadCtx>,
     range: Range<u64>,
-    /// Shared with the `ReadStream`, set as soon as the object's metadata is known.
     known: Arc<OnceLock<ObjectMeta>>,
-    /// Block indexes. `first..end` cover the range, `next` is the next to schedule, `emit` the next
-    /// to yield.
     first: u32,
     next: u32,
     end: u32,
     emit: u32,
     window: VecDeque<SlotHandle>,
-    /// Set after one restart on a stale generation, a second stale is surfaced as an error.
     restarted: bool,
     done: bool,
 }
@@ -170,21 +163,22 @@ impl Reader {
         self.known.get().map(|m| m.size)
     }
 
-    fn learn_size(&mut self) {
+    fn learn(&mut self, meta: Option<ObjectMeta>) {
         if self.known.get().is_some() {
             return;
         }
-        if let Some(meta) = self.engine.meta.any(&self.ctx.key) {
-            self.range.end = self.range.end.min(meta.size);
-            self.end = self
-                .end
-                .min(self.ctx.namespace.config.block_size.count(meta.size));
-            let _ = self.known.set(meta);
-        }
+        let Some(meta) = meta.or_else(|| self.engine.meta.any(&self.ctx.key)) else {
+            return;
+        };
+        self.range.end = self.range.end.min(meta.size);
+        self.end = self
+            .end
+            .min(self.ctx.namespace.config.block_size.count(meta.size));
+        let _ = self.known.set(meta);
     }
 
     async fn fill(&mut self) {
-        self.learn_size();
+        self.learn(None);
         let config = self.ctx.namespace.config;
         let limit = if self.size().is_some() {
             config.read_window
@@ -214,7 +208,12 @@ impl Reader {
         self.window.clear();
         let ctx = self
             .engine
-            .resolve_ctx(&self.ctx.namespace, &self.ctx.name, &self.request)
+            .resolve_ctx(
+                &self.ctx.namespace,
+                &self.ctx.name,
+                &self.request,
+                self.ctx.policy,
+            )
             .await?;
         let meta = ctx.meta.clone().ok_or(NestorError::Stale)?;
         self.range = self.request.resolve(meta.size)?;
@@ -242,7 +241,8 @@ impl Reader {
             self.emit += 1;
             match handle.wait().await {
                 Ok(block) => {
-                    self.learn_size();
+                    self.learn(Some(block.meta));
+                    let block = block.data;
                     let bs = self.ctx.namespace.config.block_size;
                     let within = bs.slice_within(index, &self.range);
                     if block.is_empty() || within.start >= block.len() {

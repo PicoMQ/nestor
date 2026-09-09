@@ -6,13 +6,12 @@ use std::collections::HashMap;
 use std::hash::{BuildHasher, Hash};
 use std::sync::{Arc, Mutex};
 
-use bytes::Bytes;
 use tokio::sync::watch;
 
 use crate::error::NestorError;
-use crate::key::BlockKey;
+use crate::key::{Block, BlockKey};
 
-pub(crate) type BlockResult = Result<Bytes, Arc<NestorError>>;
+pub(crate) type BlockResult = Result<Block, Arc<NestorError>>;
 
 type Receiver = watch::Receiver<Option<BlockResult>>;
 
@@ -71,7 +70,6 @@ impl Drop for Slot {
     }
 }
 
-/// The owner holds the `Slot` and must resolve it.
 pub(crate) enum Registration {
     Owner(Slot, SlotHandle),
     Waiter(SlotHandle),
@@ -131,8 +129,18 @@ impl Inflight {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+
     use super::*;
     use crate::key::NamespaceId;
+    use crate::origin::ObjectMeta;
+
+    fn block(data: &'static [u8]) -> Block {
+        Block::new(
+            ObjectMeta::new(data.len() as u64, None),
+            Bytes::from_static(data),
+        )
+    }
 
     fn key(i: u32) -> BlockKey {
         BlockKey {
@@ -154,9 +162,12 @@ mod tests {
         };
         assert_eq!(inflight.len(), 1);
         let task = tokio::spawn(waiter.wait());
-        slot.resolve(Ok(Bytes::from_static(b"data")));
-        assert_eq!(task.await.unwrap().unwrap(), Bytes::from_static(b"data"));
-        assert_eq!(own.wait().await.unwrap(), Bytes::from_static(b"data"));
+        slot.resolve(Ok(block(b"data")));
+        assert_eq!(
+            task.await.unwrap().unwrap().data,
+            Bytes::from_static(b"data")
+        );
+        assert_eq!(own.wait().await.unwrap().data, Bytes::from_static(b"data"));
         assert_eq!(inflight.len(), 0);
     }
 

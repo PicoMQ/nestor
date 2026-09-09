@@ -11,11 +11,12 @@ use figment::Figment;
 use figment::providers::{Env, Format, Toml};
 use http::Uri;
 use nestor::{
-    BlockSize, CacheConfig, Compression, Consistency, DiskConfig, HedgeConfig, NamespaceConfig,
-    NestorBuilder, RecoverMode, RetryConfig,
+    BlockSize, CacheConfig, Compression, Consistency, DiskConfig, FetchPolicy, HedgeConfig,
+    NamespaceConfig, NestorBuilder, RecoverMode,
 };
 use nestor_client::{ClusterConfig, Credentials, Membership};
 use nestor_s3::{Addressing, Auth, OriginConfig, S3Config};
+use nestor_store::Transport;
 use serde::Deserialize;
 
 #[derive(Debug, Default, Deserialize)]
@@ -140,6 +141,8 @@ pub struct Origin {
     pub region: String,
     pub credentials: OriginCredentials,
     pub virtual_hosted: bool,
+    #[serde(with = "humantime_serde")]
+    pub connect_timeout: Duration,
 }
 
 impl Default for Origin {
@@ -149,6 +152,7 @@ impl Default for Origin {
             region: "us-east-1".into(),
             credentials: OriginCredentials::Default,
             virtual_hosted: false,
+            connect_timeout: Transport::default().connect_timeout,
         }
     }
 }
@@ -169,7 +173,8 @@ pub enum OriginCredentials {
 impl Origin {
     pub fn build(&self) -> Result<OriginConfig, Report> {
         let config = OriginConfig::anonymous(self.endpoint.clone(), self.region.clone())
-            .with_virtual_hosted(self.virtual_hosted);
+            .with_virtual_hosted(self.virtual_hosted)
+            .with_transport(Transport::default().connect_timeout(self.connect_timeout));
         Ok(match &self.credentials {
             OriginCredentials::Anonymous => config,
             OriginCredentials::Default => config
@@ -220,7 +225,6 @@ pub struct Cache {
     pub origin_concurrency: usize,
     pub readahead_concurrency: usize,
     pub hedge_concurrency: usize,
-    pub retry: RetryConfig,
 }
 
 impl Default for Cache {
@@ -233,7 +237,6 @@ impl Default for Cache {
             origin_concurrency: 64,
             readahead_concurrency: 16,
             hedge_concurrency: 16,
-            retry: RetryConfig::default(),
         }
     }
 }
@@ -251,8 +254,7 @@ impl Cache {
             .meta_capacity(self.meta_entries)
             .origin_concurrency(self.origin_concurrency)
             .readahead_concurrency(self.readahead_concurrency)
-            .hedge_concurrency(self.hedge_concurrency)
-            .retry(self.retry))
+            .hedge_concurrency(self.hedge_concurrency))
     }
 }
 
@@ -336,7 +338,7 @@ pub struct Buckets {
     pub read_window: u32,
     pub consistency: Consistency,
     pub readahead: u32,
-    pub hedge: Option<HedgeConfig>,
+    pub fetch: FetchPolicy,
     pub populate_max: Option<Byte>,
 }
 
@@ -349,7 +351,7 @@ impl Default for Buckets {
             read_window: defaults.read_window,
             consistency: defaults.consistency,
             readahead: defaults.readahead,
-            hedge: defaults.hedge,
+            fetch: defaults.fetch,
             populate_max: Some(Byte::from_u64(16 * 1024 * 1024)),
         }
     }
@@ -373,7 +375,7 @@ impl Buckets {
             read_window: self.read_window,
             consistency: self.consistency,
             readahead: self.readahead,
-            hedge: self.hedge,
+            fetch: self.fetch,
         })
     }
 }
@@ -394,6 +396,8 @@ pub struct Cluster {
     pub tls: bool,
     pub credentials: Option<ClusterCredentials>,
     pub warm_on_write: bool,
+    #[serde(with = "humantime_serde")]
+    pub connect_timeout: Duration,
 }
 
 #[derive(Debug, Deserialize)]
@@ -418,6 +422,7 @@ impl Default for Cluster {
             tls: defaults.tls,
             credentials: None,
             warm_on_write: false,
+            connect_timeout: defaults.transport.connect_timeout,
         }
     }
 }
@@ -462,6 +467,7 @@ impl Cluster {
                 access_key: c.access_key.clone(),
                 secret_key: c.secret_key.clone(),
             }),
+            transport: Transport::default().connect_timeout(self.connect_timeout),
         })
     }
 }
@@ -516,6 +522,7 @@ mod tests {
                 endpoint = "http://minio:9000"
                 region = "us-east-1"
                 credentials = { source = "static", access_key = "ak", secret_key = "sk" }
+                connect_timeout = "2s"
 
                 [auth]
                 mode = "static"
@@ -524,7 +531,6 @@ mod tests {
 
                 [cache]
                 memory = "2 GiB"
-                retry = { attempts = 5, base = "10ms", max = "500ms" }
                 [cache.disk]
                 path = "/mnt/nestor"
                 capacity = "100 GiB"
@@ -533,6 +539,11 @@ mod tests {
                 [buckets]
                 block_size = "4 MiB"
                 consistency = { mode = "etag", ttl = "5m" }
+
+                [buckets.fetch]
+                attempts = 5
+                backoff = "10ms"
+                first_byte = "1s"
                 hedge = { factor = 3.0, min = "20ms", max = "1s" }
                 "#,
             )?;
@@ -545,8 +556,7 @@ mod tests {
                 AddressingStyle::VirtualHosted { ref domain } if domain == "s3.internal"
             ));
             assert_eq!(config.cache.memory.as_u64(), 512 * 1024 * 1024);
-            assert_eq!(config.cache.retry.attempts, 5);
-            assert_eq!(config.cache.retry.base, Duration::from_millis(10));
+            assert_eq!(config.origin.connect_timeout, Duration::from_secs(2));
             let disk = config.cache.disk.as_ref().unwrap();
             assert_eq!(disk.capacity.as_u64(), 100 * 1024 * 1024 * 1024);
             assert!(matches!(disk.compression, DiskCompression::Lz4));
@@ -558,7 +568,14 @@ mod tests {
                     ttl: Duration::from_secs(300)
                 }
             );
-            assert_eq!(namespace.hedge.unwrap().min, Duration::from_millis(20));
+            assert_eq!(namespace.fetch.attempts, 5);
+            assert_eq!(namespace.fetch.backoff, Duration::from_millis(10));
+            assert_eq!(namespace.fetch.first_byte, Duration::from_secs(1));
+            assert_eq!(namespace.fetch.deadline, FetchPolicy::default().deadline);
+            assert_eq!(
+                namespace.fetch.hedge.unwrap().min,
+                Duration::from_millis(20)
+            );
             Ok(())
         });
     }

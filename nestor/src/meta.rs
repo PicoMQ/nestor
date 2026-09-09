@@ -47,7 +47,6 @@ impl MetaCache {
         }
     }
 
-    /// Size and `ETag` regardless of age, valid for a read that already pinned its tag.
     pub fn any(&self, key: &ObjectKey) -> Option<ObjectMeta> {
         self.cache.get(key).map(|entry| entry.meta.clone())
     }

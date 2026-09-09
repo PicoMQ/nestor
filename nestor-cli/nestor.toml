@@ -11,6 +11,7 @@ listen = "127.0.0.1:9000"
 endpoint = "https://s3.us-east-1.amazonaws.com"      # any S3-compatible endpoint, such as http://minio:9000
 region = "us-east-1"
 virtual_hosted = false
+connect_timeout = "5s"        # retries and request timeouts are [buckets.fetch], not the client
 # source is "default" (env, profile, IMDS, IRSA), "anonymous" or "static"
 credentials = { source = "default" }
 # credentials = { source = "static", access_key = "...", secret_key = "..." }
@@ -30,7 +31,6 @@ meta_entries = 100000
 origin_concurrency = 64
 readahead_concurrency = 16
 hedge_concurrency = 16
-retry = { attempts = 3, base = "50ms", max = "2s" }
 
 # [cache.disk]
 # path = "/var/lib/nestor"
@@ -46,8 +46,16 @@ fetch_window = 8              # blocks per origin GET on a miss
 read_window = 16              # blocks in flight per stream
 consistency = { mode = "etag", ttl = "60s" }   # or { mode = "immutable" }
 readahead = 8                 # blocks prefetched on sequential access, 0 disables
-hedge = { factor = 3.0, min = "50ms", max = "2s" }
 populate_max = "16 MiB"       # PUT bodies up to this size are cached on the way through
+
+[buckets.fetch]               # how a miss goes to the origin, overridable per GET with X-Nestor-Fetch
+attempts = 3                  # tries per fetch, including the first
+backoff = "50ms"              # doubles per retry up to backoff_max
+backoff_max = "2s"
+first_byte = "5s"             # headers must arrive within this per attempt
+attempt = "30s"               # one attempt including its body
+deadline = "60s"              # the fetch as a whole, across attempts
+hedge = { factor = 3.0, min = "50ms", max = "2s" }   # or false to disable
 
 # Serve reads from a cluster of nestor nodes instead of the origin. This binary becomes the local
 # tier, writes still go to [origin]. Use either nodes or dns.
@@ -60,6 +68,7 @@ populate_max = "16 MiB"       # PUT bodies up to this size are cached on the way
 # load_limit = 256            # in flight requests per node before spilling to the next choice
 # down_for = "5s"             # how long a node is skipped after a connection failure
 # hedge = { factor = 3.0, min = "50ms", max = "2s" }
+# connect_timeout = "5s"
 # tls = false
 # credentials = { access_key = "...", secret_key = "..." }   # what the nodes' [auth] expects
 # warm_on_write = false       # after a PUT, fetch each block on its owning node

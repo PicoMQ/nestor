@@ -11,6 +11,7 @@ pub const ORIGIN_REQUESTS: &str = "nestor_origin_requests_total";
 pub const ORIGIN_BYTES: &str = "nestor_origin_bytes_total";
 pub const ORIGIN_ERRORS: &str = "nestor_origin_errors_total";
 pub const ORIGIN_RETRIES: &str = "nestor_origin_retries_total";
+pub const ORIGIN_TIMEOUTS: &str = "nestor_origin_timeouts_total";
 pub const ORIGIN_TTFB: &str = "nestor_origin_ttfb_seconds";
 pub const HEDGES: &str = "nestor_hedges_total";
 pub const HEDGE_WINS: &str = "nestor_hedge_wins_total";
@@ -29,6 +30,7 @@ pub(crate) struct NamespaceMetrics {
     pub origin_bytes: Counter,
     pub origin_errors: Counter,
     pub origin_retries: Counter,
+    pub origin_timeouts: Counter,
     pub origin_ttfb: Histogram,
     pub hedges: Counter,
     pub hedge_wins: Counter,
@@ -49,6 +51,7 @@ impl NamespaceMetrics {
             origin_bytes: counter!(ORIGIN_BYTES, LABEL_NAMESPACE => ns.clone()),
             origin_errors: counter!(ORIGIN_ERRORS, LABEL_NAMESPACE => ns.clone()),
             origin_retries: counter!(ORIGIN_RETRIES, LABEL_NAMESPACE => ns.clone()),
+            origin_timeouts: counter!(ORIGIN_TIMEOUTS, LABEL_NAMESPACE => ns.clone()),
             origin_ttfb: histogram!(ORIGIN_TTFB, LABEL_NAMESPACE => ns.clone()),
             hedges: counter!(HEDGES, LABEL_NAMESPACE => ns.clone()),
             hedge_wins: counter!(HEDGE_WINS, LABEL_NAMESPACE => ns.clone()),

@@ -7,8 +7,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::StreamExt;
 use nestor::{
-    BlockSize, CacheConfig, Consistency, DiskConfig, HedgeConfig, MemoryOrigin, Namespace,
-    NamespaceId, Nestor, NestorError, ReadRange, RetryConfig,
+    BlockSize, CacheConfig, Consistency, DiskConfig, FetchOverrides, FetchPolicy, HedgeConfig,
+    MemoryOrigin, Namespace, NamespaceId, Nestor, NestorError, OriginError, ReadOptions, ReadRange,
 };
 
 const KIB: usize = 1024;
@@ -20,11 +20,6 @@ fn pattern(len: usize) -> Bytes {
 
 async fn engine(ns: Namespace) -> (Nestor, NamespaceId) {
     let nestor = Nestor::builder(CacheConfig::memory(64 * 1024 * 1024))
-        .retry(RetryConfig {
-            attempts: 3,
-            base: Duration::from_millis(1),
-            max: Duration::from_millis(5),
-        })
         .namespace(ns)
         .build()
         .await
@@ -39,7 +34,11 @@ fn namespace(origin: Arc<MemoryOrigin>, consistency: Consistency) -> Namespace {
         .fetch_window(4)
         .read_window(8)
         .consistency(consistency)
-        .hedge(None)
+        .fetch(
+            FetchPolicy::default()
+                .hedge(None)
+                .backoff(Duration::from_millis(1), Duration::from_millis(5)),
+        )
 }
 
 #[tokio::test]
@@ -197,6 +196,28 @@ async fn bounded_range_past_eof_is_truncated_without_head() {
 }
 
 #[tokio::test]
+async fn failed_get_of_unknown_size_is_settled_by_a_head() {
+    let origin = Arc::new(MemoryOrigin::new());
+    let data = pattern(BLOCK as usize + 100);
+    origin.put("obj", data.clone());
+    let (nestor, id) = engine(namespace(origin.clone(), Consistency::Immutable)).await;
+
+    let err = nestor.read(id, "obj", 5 * BLOCK..6 * BLOCK).await;
+    assert!(matches!(err, Err(NestorError::Range(..))));
+    assert_eq!(origin.gets(), 1);
+    assert_eq!(origin.heads(), 1);
+
+    let second = Arc::new(MemoryOrigin::new());
+    second.put("obj", data.clone());
+    let (nestor, id) = engine(namespace(second.clone(), Consistency::Immutable)).await;
+    second.fail_next(1);
+    let out = nestor.read(id, "obj", 10..20).await.unwrap();
+    assert_eq!(out, data.slice(10..20));
+    assert_eq!(second.gets(), 2);
+    assert_eq!(second.heads(), 1);
+}
+
+#[tokio::test]
 async fn missing_object_is_not_found() {
     let origin = Arc::new(MemoryOrigin::new());
     let (nestor, id) = engine(namespace(origin.clone(), Consistency::Immutable)).await;
@@ -241,7 +262,8 @@ async fn transient_origin_failures_are_retried() {
 
     let out = nestor.read(id, "obj", 0..data.len() as u64).await.unwrap();
     assert_eq!(out, data);
-    assert_eq!(origin.gets(), 3);
+    assert_eq!(origin.gets(), 2);
+    assert_eq!(origin.heads(), 2);
 }
 
 #[tokio::test]
@@ -249,11 +271,12 @@ async fn hedge_fires_on_slow_primary() {
     let origin = Arc::new(MemoryOrigin::new());
     let data = pattern(BLOCK as usize);
     origin.put("obj", data.clone());
-    let ns = namespace(origin.clone(), Consistency::Immutable).hedge(Some(HedgeConfig {
+    let mut ns = namespace(origin.clone(), Consistency::Immutable);
+    ns.config.fetch.hedge = Some(HedgeConfig {
         factor: 1.0,
         min: Duration::from_millis(10),
         max: Duration::from_millis(10),
-    }));
+    });
     let (nestor, id) = engine(ns).await;
 
     origin.slow_next(1, Duration::from_millis(500));
@@ -262,6 +285,74 @@ async fn hedge_fires_on_slow_primary() {
     assert_eq!(out, data.slice(0..100));
     assert!(started.elapsed() < Duration::from_millis(400));
     assert_eq!(origin.gets(), 2);
+}
+
+fn is_timeout(err: &NestorError) -> bool {
+    matches!(err, NestorError::Origin(OriginError::Timeout(_)))
+}
+
+#[tokio::test]
+async fn first_byte_timeout_retries_then_fails() {
+    let origin = Arc::new(MemoryOrigin::new());
+    origin.put("obj", pattern(BLOCK as usize));
+    let mut ns = namespace(origin.clone(), Consistency::Immutable);
+    ns.config.fetch = ns
+        .config
+        .fetch
+        .attempts(2)
+        .first_byte(Duration::from_millis(20));
+    let (nestor, id) = engine(ns).await;
+
+    origin.slow_next(usize::MAX, Duration::from_secs(5));
+    let started = std::time::Instant::now();
+    let err = nestor.read(id, "obj", 0..100).await.unwrap_err();
+    assert!(is_timeout(&err), "{err}");
+    assert!(started.elapsed() < Duration::from_millis(500));
+    assert_eq!(origin.gets(), 2);
+}
+
+#[tokio::test]
+async fn deadline_caps_the_retry_budget() {
+    let origin = Arc::new(MemoryOrigin::new());
+    origin.put("obj", pattern(BLOCK as usize));
+    let mut ns = namespace(origin.clone(), Consistency::Immutable);
+    ns.config.fetch = ns
+        .config
+        .fetch
+        .attempts(100)
+        .first_byte(Duration::from_millis(10))
+        .deadline(Duration::from_millis(60));
+    let (nestor, id) = engine(ns).await;
+
+    origin.slow_next(usize::MAX, Duration::from_secs(5));
+    let err = nestor.read(id, "obj", 0..100).await.unwrap_err();
+    assert!(is_timeout(&err), "{err}");
+    assert!(origin.gets() < 100);
+}
+
+#[tokio::test]
+async fn read_overrides_loosen_the_namespace_policy() {
+    let origin = Arc::new(MemoryOrigin::new());
+    let data = pattern(BLOCK as usize);
+    origin.put("obj", data.clone());
+    let mut ns = namespace(origin.clone(), Consistency::Immutable);
+    ns.config.fetch = ns
+        .config
+        .fetch
+        .attempts(1)
+        .first_byte(Duration::from_millis(20));
+    let (nestor, id) = engine(ns).await;
+
+    origin.slow_next(usize::MAX, Duration::from_millis(80));
+    let err = nestor.read(id, "obj", 0..100).await.unwrap_err();
+    assert!(is_timeout(&err), "{err}");
+
+    let options = ReadOptions::range(0..100).fetch(FetchOverrides {
+        first_byte: Some(Duration::from_secs(1)),
+        ..FetchOverrides::default()
+    });
+    let stream = nestor.get_opts(id, "obj", options).await.unwrap();
+    assert_eq!(stream.collect().await.unwrap(), data.slice(0..100));
 }
 
 #[tokio::test]
@@ -400,6 +491,55 @@ async fn hybrid_cache_survives_memory_pressure() {
 }
 
 #[tokio::test]
+async fn restart_serves_recovered_blocks_with_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = pattern(6 * BLOCK as usize + 99);
+    let disk = || DiskConfig {
+        region_size: 4 * 1024 * 1024,
+        direct_io: false,
+        ..DiskConfig::new(dir.path(), 64 * 1024 * 1024)
+    };
+
+    let origin = Arc::new(MemoryOrigin::new());
+    let etag = origin.put("obj", data.clone());
+    let first = Nestor::builder(CacheConfig::memory(64 * 1024 * 1024).disk(disk()))
+        .namespace(namespace(origin.clone(), Consistency::Immutable))
+        .build()
+        .await
+        .unwrap();
+    let id = first.namespace("test").unwrap();
+    assert_eq!(
+        first.read(id, "obj", 0..data.len() as u64).await.unwrap(),
+        data
+    );
+    first.close().await.unwrap();
+
+    let offline = Arc::new(MemoryOrigin::new());
+    offline.fail_next(usize::MAX);
+    let second = Nestor::builder(CacheConfig::memory(64 * 1024 * 1024).disk(disk()))
+        .namespace(namespace(offline.clone(), Consistency::Immutable))
+        .build()
+        .await
+        .unwrap();
+    let id = second.namespace("test").unwrap();
+
+    let mut stream = second
+        .get(id, "obj", 2 * BLOCK + 7..3 * BLOCK)
+        .await
+        .unwrap();
+    let meta = stream.ready().await.unwrap();
+    assert_eq!(meta.size, data.len() as u64);
+    assert_eq!(meta.etag.as_ref(), Some(&etag));
+    assert_eq!(
+        stream.collect().await.unwrap(),
+        data.slice(2 * BLOCK as usize + 7..3 * BLOCK as usize)
+    );
+    assert_eq!(offline.gets(), 0);
+    assert_eq!(offline.heads(), 0);
+    second.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn unknown_namespace_and_closed_engine_error() {
     let origin = Arc::new(MemoryOrigin::new());
     let (nestor, _) = engine(namespace(origin, Consistency::Immutable)).await;
@@ -411,4 +551,77 @@ async fn unknown_namespace_and_closed_engine_error() {
         nestor.read(id, "obj", 0..1).await,
         Err(NestorError::Closed)
     ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn faulty_origin_never_truncates_a_read() {
+    let origin = Arc::new(MemoryOrigin::new());
+    let objects: Vec<Bytes> = (0..8)
+        .map(|i| pattern(5 * BLOCK as usize + 1000 * i + 17))
+        .collect();
+    for (i, data) in objects.iter().enumerate() {
+        origin.put(format!("obj{i}"), data.clone());
+    }
+    let mut ns = namespace(origin.clone(), Consistency::Immutable);
+    ns.config.fetch = ns.config.fetch.attempts(6).hedge(Some(HedgeConfig {
+        factor: 1.0,
+        min: Duration::from_millis(1),
+        max: Duration::from_millis(2),
+    }));
+    ns.config.fetch_window = 2;
+    let (nestor, id) = engine(ns).await;
+    origin.set_latency(Duration::from_millis(3));
+    origin.fail_every(7);
+
+    let tasks: Vec<_> = (0..16u64)
+        .map(|reader| {
+            let nestor = nestor.clone();
+            let objects = objects.clone();
+            tokio::spawn(async move {
+                for step in 0..200u64 {
+                    let x = (reader * 7919 + step * 104_729) % 1_000_003;
+                    let i = (x % 8) as usize;
+                    let len = objects[i].len() as u64;
+                    let start = (x * 31) % (len - 1);
+                    let end = (start + 1 + (x * 17) % (2 * BLOCK)).min(len);
+                    match nestor.read(id, &format!("obj{i}"), start..end).await {
+                        Ok(out) => assert_eq!(out, objects[i].slice(start as usize..end as usize)),
+                        Err(NestorError::Origin(_)) => {}
+                        Err(e) => panic!("{e}"),
+                    }
+                }
+            })
+        })
+        .collect();
+    for task in tasks {
+        task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn probe_and_head_are_retried() {
+    let origin = Arc::new(MemoryOrigin::new());
+    let data = pattern(3 * BLOCK as usize);
+    origin.put("obj", data.clone());
+    let (nestor, id) = engine(namespace(origin.clone(), Consistency::Immutable)).await;
+
+    origin.fail_next(1);
+    let stream = nestor
+        .get(id, "obj", ReadRange::From(BLOCK + 5))
+        .await
+        .unwrap();
+    let out = stream.collect().await.unwrap();
+    assert_eq!(out, data.slice(BLOCK as usize + 5..));
+    assert_eq!(origin.gets(), 2);
+    assert_eq!(origin.heads(), 1);
+
+    let second = Arc::new(MemoryOrigin::new());
+    second.put("obj", data.clone());
+    let (nestor, id) = engine(namespace(second.clone(), Consistency::Immutable)).await;
+    second.fail_next(1);
+    assert_eq!(
+        nestor.head(id, "obj").await.unwrap().size,
+        data.len() as u64
+    );
+    assert_eq!(second.heads(), 2);
 }

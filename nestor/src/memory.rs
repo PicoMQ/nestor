@@ -36,6 +36,7 @@ pub struct MemoryOrigin {
     latency: Mutex<Duration>,
     slow: Mutex<Option<(usize, Duration)>>,
     failures: Mutex<usize>,
+    fail_every: AtomicUsize,
     versions: AtomicU64,
 }
 
@@ -54,6 +55,7 @@ impl MemoryOrigin {
             latency: Mutex::new(Duration::ZERO),
             slow: Mutex::new(None),
             failures: Mutex::new(0),
+            fail_every: AtomicUsize::new(0),
             versions: AtomicU64::new(1),
         }
     }
@@ -103,14 +105,20 @@ impl MemoryOrigin {
         *self.failures.lock().unwrap() = count;
     }
 
+    pub fn fail_every(&self, n: usize) {
+        self.fail_every.store(n, Ordering::Relaxed);
+    }
+
     fn take_failure(&self) -> bool {
         let mut f = self.failures.lock().unwrap();
         if *f > 0 {
             *f -= 1;
-            true
-        } else {
-            false
+            return true;
         }
+        let every = self.fail_every.load(Ordering::Relaxed);
+        let requests =
+            self.stats.gets.load(Ordering::Relaxed) + self.stats.heads.load(Ordering::Relaxed);
+        every > 0 && requests.is_multiple_of(every)
     }
 
     fn delay(&self) -> Duration {
@@ -157,7 +165,9 @@ fn meta_of(stored: &StoredObject) -> ObjectMeta {
 fn resolve(range: Option<Range<u64>>, size: u64) -> Result<Range<u64>, OriginError> {
     match range {
         None => Ok(0..size),
-        Some(r) if r.start >= size || r.start >= r.end => Err(OriginError::InvalidRange),
+        Some(r) if r.start >= size || r.start >= r.end => Err(OriginError::io(
+            std::io::Error::other("range not satisfiable"),
+        )),
         Some(r) => Ok(r.start..r.end.min(size)),
     }
 }

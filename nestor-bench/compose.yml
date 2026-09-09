@@ -1,0 +1,66 @@
+# RustFS as the origin and one nestor binary whose origin is the bench's proxy on the host.
+# From the repository root: docker build -t nestor-e2e:local . && docker compose -f nestor-bench/compose.yml up -d
+#
+# RustFS:          http://localhost:19200
+# nestor S3:       http://localhost:19302, metrics http://localhost:19303
+# bench proxy:     host port 19300, reached from the nestor container as host.docker.internal:19300
+
+name: nestor-bench
+
+services:
+  rustfs:
+    image: rustfs/rustfs:1.0.0-rc.3
+    command: ["/data"]
+    environment:
+      RUSTFS_ACCESS_KEY: nestor
+      RUSTFS_SECRET_KEY: nestornestor
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_CONSOLE_ENABLE: "false"
+    ports:
+      - "19200:9000"
+    volumes:
+      - rustfs-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/health || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+
+  createbucket:
+    image: amazon/aws-cli:2.36.28
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: nestor
+      AWS_SECRET_ACCESS_KEY: nestornestor
+      AWS_DEFAULT_REGION: us-east-1
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - aws --endpoint-url http://rustfs:9000 s3 mb s3://nestor 2>/dev/null || true
+    restart: "no"
+
+  nestor:
+    image: ${NESTOR_IMAGE:-nestor-e2e:local}
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - ./nestor.toml:/etc/nestor/nestor.toml:ro
+      - /var/lib/nestor
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      createbucket:
+        condition: service_completed_successfully
+    ports:
+      - "19302:9000"
+      - "19303:9100"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/-/health || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  rustfs-data:

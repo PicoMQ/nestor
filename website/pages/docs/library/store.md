@@ -33,16 +33,29 @@
 ```rust
 use std::sync::Arc;
 use nestor::Namespace;
-use nestor_store::ObjectStoreOrigin;
+use nestor_store::{ObjectStoreOrigin, Transport};
 use object_store::aws::AmazonS3Builder;
 
 let s3: Arc<dyn object_store::ObjectStore> = Arc::new(
-    AmazonS3Builder::from_env().with_bucket_name("data").build()?,
+    AmazonS3Builder::from_env()
+        .with_bucket_name("data")
+        .with_client_options(Transport::default().client_options())
+        .with_retry(Transport::default().retry_config())
+        .build()?,
 );
 let namespace = Namespace::new("data", Arc::new(ObjectStoreOrigin::new(s3)));
 ```
 
 The origin maps `GetOptions` onto `object_store::GetOptions`, ranges become `GetRange::Bounded`, `if_match` and `if_none_match` pass through, and `object_store` errors are classified into `OriginError` variants so the fetcher retries and fails correctly. Anything `object_store` supports is an origin: S3 and compatible stores, GCS, Azure, HTTP, the local filesystem and `InMemory` for tests.
+
+`Transport` builds the client options an origin should run with.
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| Retries | off | The namespace `FetchPolicy` retries |
+| Request timeout | off | `first_byte`, `attempt` and `deadline` bound the request |
+| `connect_timeout` | `5s` | The one timeout that stays on the connection |
+| `pool_max_idle_per_host` | `64` | Matches `origin_concurrency` |
 
 ## NestorStore
 

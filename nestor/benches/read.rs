@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use nestor::{BlockSize, CacheConfig, Consistency, MemoryOrigin, Namespace, NamespaceId, Nestor};
+use nestor::{
+    BlockSize, CacheConfig, Consistency, FetchPolicy, MemoryOrigin, Namespace, NamespaceId, Nestor,
+};
 
 const OBJECT: &str = "bench/object";
 const SIZE: usize = 64 * 1024 * 1024;
@@ -16,7 +18,7 @@ async fn setup(block: u32) -> (Nestor, NamespaceId) {
     let ns = Namespace::new("bench", origin)
         .block_size(BlockSize::new(block).unwrap())
         .consistency(Consistency::Immutable)
-        .hedge(None);
+        .fetch(FetchPolicy::default().hedge(None));
     let nestor = Nestor::builder(CacheConfig::memory(256 * 1024 * 1024))
         .namespace(ns)
         .build()

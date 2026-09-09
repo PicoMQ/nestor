@@ -13,10 +13,10 @@ pub enum OriginError {
     PreconditionFailed,
     #[error("not modified")]
     NotModified,
-    #[error("range not satisfiable")]
-    InvalidRange,
     #[error("origin returned {got} bytes for a request of {expected}")]
     ShortRead { expected: u64, got: u64 },
+    #[error("origin did not answer within {0:?}")]
+    Timeout(std::time::Duration),
     #[error(transparent)]
     Io(Box<dyn std::error::Error + Send + Sync + 'static>),
 }
@@ -30,7 +30,10 @@ impl OriginError {
     }
 
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::Io(_) | Self::ShortRead { .. })
+        matches!(
+            self,
+            Self::Io(_) | Self::ShortRead { .. } | Self::Timeout(_)
+        )
     }
 }
 

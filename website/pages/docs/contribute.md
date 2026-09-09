@@ -37,6 +37,14 @@ KEEP=1 nestor-e2e/e2e.sh single    # leave the stack up afterwards
 
 See [Quick start](/docs/quick-start) for running the same stacks by hand.
 
+`nestor-bench/` measures the engine, the binary and the bare origin under s3stream-shaped workloads. Every origin request goes through a counting proxy so the three targets are comparable. Each run writes a JSON report, `compare` diffs two:
+
+```bash
+nestor-bench/bench.sh                          # the default matrix
+TARGETS="library origin" nestor-bench/bench.sh tail errors   # a subset
+cargo run -p nestor-bench --bin bench -- compare reports/tail-library.json reports/tail-origin.json
+```
+
 ## Docs
 
 The site is VitePress. From `website/`:

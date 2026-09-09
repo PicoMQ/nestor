@@ -138,8 +138,6 @@ struct Captured {
     overflow: bool,
 }
 
-/// Collects the decoded body up to `limit` bytes. Past the limit the capture is discarded rather
-/// than truncated.
 pub struct Capture {
     inner: Arc<Mutex<Captured>>,
     limit: usize,

@@ -68,8 +68,6 @@ impl BlockSize {
         }
     }
 
-    /// Blocks the first origin GET for `request` covers. `None` when the start depends on the
-    /// object size.
     pub(crate) fn first_group(self, request: &ReadRange, window: u32) -> Option<Range<u32>> {
         let (start, end) = match request {
             ReadRange::Full => (0, u32::MAX),
@@ -84,8 +82,8 @@ impl BlockSize {
     pub fn slice_within(self, index: u32, range: &Range<u64>) -> Range<usize> {
         let block_start = self.offset(index);
         let block_end = block_start + self.bytes();
-        let start = range.start.max(block_start) - block_start;
-        let end = range.end.min(block_end) - block_start;
+        let start = range.start.clamp(block_start, block_end) - block_start;
+        let end = range.end.clamp(block_start, block_end) - block_start;
         start as usize..end as usize
     }
 }
@@ -96,8 +94,9 @@ impl Default for BlockSize {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum ReadRange {
+    #[default]
     Full,
     Bounded(Range<u64>),
     From(u64),
@@ -142,13 +141,11 @@ impl From<Range<u64>> for ReadRange {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Contiguous run of missing blocks fetched in one origin GET.
 pub(crate) struct FetchGroup {
     pub first: u32,
     pub count: u32,
 }
 
-/// Runs never cross a `window` boundary.
 pub(crate) fn group_misses(misses: impl IntoIterator<Item = u32>, window: u32) -> Vec<FetchGroup> {
     let window = window.max(1);
     let mut groups: Vec<FetchGroup> = Vec::new();
@@ -164,7 +161,6 @@ pub(crate) fn group_misses(misses: impl IntoIterator<Item = u32>, window: u32) -
     groups
 }
 
-/// Blocks from `next` up to the next `window` boundary or `end`, whichever comes first.
 pub(crate) fn aligned_take(next: u32, end: u32, window: u32) -> u32 {
     let window = window.max(1);
     let boundary = (next / window + 1).saturating_mul(window);

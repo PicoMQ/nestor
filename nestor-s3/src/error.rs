@@ -4,7 +4,7 @@ use axum::body::Body;
 use axum::response::{IntoResponse, Response};
 use http::StatusCode;
 use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
-use nestor::NestorError;
+use nestor::{NestorError, OriginError};
 
 #[derive(Debug, Clone)]
 pub struct S3Error {
@@ -133,6 +133,12 @@ impl S3Error {
                 "ServiceUnavailable",
                 "cache is shutting down",
             ),
+            NestorError::Origin(timeout @ OriginError::Timeout(_)) => Self::new(
+                StatusCode::GATEWAY_TIMEOUT,
+                "GatewayTimeout",
+                timeout.to_string(),
+            )
+            .resource(key),
             other => Self::bad_gateway(other.to_string()),
         }
     }

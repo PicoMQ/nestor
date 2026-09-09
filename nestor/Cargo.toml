@@ -22,6 +22,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 metrics = { workspace = true }
+humantime = "2.4.0"
 
 [features]
 serde = ["dep:serde", "dep:humantime-serde"]
@@ -31,6 +32,7 @@ proptest = { workspace = true }
 tempfile = { workspace = true }
 criterion = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+toml = "1.1.5"
 
 [[bench]]
 name = "read"

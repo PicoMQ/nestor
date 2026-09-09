@@ -12,7 +12,7 @@ use futures::TryStreamExt;
 use http::header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, HeaderMap, HeaderValue};
 use http::request::Parts;
 use http::{Method, StatusCode};
-use nestor::{NamespaceId, NestorError, Precondition, ReadRange};
+use nestor::{NamespaceId, NestorError, Precondition, ReadOptions, ReadRange};
 use quick_xml::Reader;
 use quick_xml::escape::resolve_predefined_entity;
 use quick_xml::events::Event;
@@ -20,7 +20,9 @@ use quick_xml::events::Event;
 use crate::addressing::Target;
 use crate::auth::query_param;
 use crate::error::S3Error;
-use crate::headers::{content_headers, object_headers, parse_range, preconditions};
+use crate::headers::{
+    content_headers, fetch_overrides, object_headers, parse_range, preconditions,
+};
 use crate::service::S3Service;
 
 pub async fn health() -> &'static str {
@@ -74,7 +76,8 @@ async fn serve(service: &S3Service, req: &Parts, target: &Target) -> Result<Resp
             .map_err(|e| S3Error::from_nestor(&e, key))?;
         (meta, None)
     } else {
-        let mut stream = match nestor.get(ns, key, request.clone()).await {
+        let options = ReadOptions::range(request.clone()).fetch(fetch_overrides(&req.headers)?);
+        let mut stream = match nestor.get_opts(ns, key, options).await {
             Ok(stream) => stream,
             Err(e) => return read_failure(&e, key),
         };
@@ -139,7 +142,6 @@ fn unsatisfiable(key: &str, size: u64) -> Response {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// How a forwarded request affects the cache once the origin accepts it.
 enum Mutation {
     None,
     PutObject,
