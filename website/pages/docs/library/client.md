@@ -33,6 +33,7 @@ let cluster = Cluster::new(
 | `load_limit` | `256` | In-flight requests per node before spilling to the next ranked node. |
 | `down_for` | `5s` | How long a node is skipped after a connection failure. |
 | `hedge` | `Some(HedgeConfig::default())` | Cross-node hedging. `None` disables. |
+| `transport` | `Transport::default()` | Node connections, `5s` connect timeout. Client retries and request timeouts are off, the cluster and the engine retry. |
 | `tls` | `false` | `https` toward nodes. |
 | `credentials` | `None` | SigV4 credentials matching the nodes' `[auth]`. `None` sends unsigned requests. |
 

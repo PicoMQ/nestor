@@ -10,16 +10,8 @@ pub(crate) fn from_store(e: Error) -> OriginError {
         Error::NotFound { .. } => OriginError::NotFound,
         Error::Precondition { .. } => OriginError::PreconditionFailed,
         Error::NotModified { .. } => OriginError::NotModified,
-        Error::Generic { ref source, .. } if is_invalid_range(source.as_ref()) => {
-            OriginError::InvalidRange
-        }
         other => OriginError::io(other),
     }
-}
-
-fn is_invalid_range(source: &(dyn std::error::Error + Send + Sync)) -> bool {
-    let text = source.to_string();
-    text.contains("InvalidRange") || text.contains("416")
 }
 
 pub(crate) fn to_store(e: NestorError, path: &str) -> Error {

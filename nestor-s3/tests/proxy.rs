@@ -4,7 +4,7 @@ use axum::Router;
 use axum::body::{Body, to_bytes};
 use bytes::Bytes;
 use http::{Method, Request, Response, StatusCode, Uri};
-use nestor::{BlockSize, CacheConfig, Consistency, Nestor};
+use nestor::{BlockSize, CacheConfig, Consistency, FetchPolicy, Nestor};
 use nestor_s3::sigv4::{Credentials, SigningKeys};
 use nestor_s3::{Addressing, Auth, OriginConfig, S3Config, S3Service};
 use tower::ServiceExt;
@@ -51,6 +51,14 @@ impl Respond for ObjectResponder {
     }
 }
 
+struct SlowResponder(ObjectResponder, std::time::Duration);
+
+impl Respond for SlowResponder {
+    fn respond(&self, request: &MockRequest) -> ResponseTemplate {
+        self.0.respond(request).set_delay(self.1)
+    }
+}
+
 async fn setup(auth: Auth, populate: Option<usize>) -> (MockServer, Router, Nestor) {
     let origin = MockServer::start().await;
     let nestor = Nestor::builder(CacheConfig::memory(8 * 1024 * 1024))
@@ -71,7 +79,7 @@ async fn setup(auth: Auth, populate: Option<usize>) -> (MockServer, Router, Nest
             .block_size(BlockSize::new(nestor::MIN_BLOCK_SIZE).unwrap())
             .consistency(Consistency::Immutable)
             .readahead(0)
-            .hedge(None),
+            .fetch(FetchPolicy::default().hedge(None)),
         populate_max: populate,
     };
     let service = S3Service::new(nestor.clone(), config);
@@ -305,4 +313,35 @@ async fn health_endpoint() {
     let (resp, body) = call(&router, get("/-/health")).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(&body[..], b"ok");
+}
+
+#[tokio::test]
+async fn fetch_header_bounds_a_slow_origin() {
+    let (origin, router, _) = setup(Auth::Anonymous, None).await;
+    Mock::given(path("/data/slow.bin"))
+        .respond_with(SlowResponder(
+            ObjectResponder(Bytes::from_static(OBJECT)),
+            std::time::Duration::from_millis(300),
+        ))
+        .mount(&origin)
+        .await;
+
+    let mut req = get("/data/slow.bin");
+    req.headers_mut().insert(
+        "x-nestor-fetch",
+        "attempts=1 first_byte=20ms".parse().unwrap(),
+    );
+    let (resp, body) = call(&router, req).await;
+    assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert!(String::from_utf8_lossy(&body).contains("GatewayTimeout"));
+
+    let mut req = get("/data/slow.bin");
+    req.headers_mut()
+        .insert("x-nestor-fetch", "first_byte=oops".parse().unwrap());
+    let (resp, _) = call(&router, req).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let (resp, body) = call(&router, get("/data/slow.bin")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(&body[..], OBJECT);
 }

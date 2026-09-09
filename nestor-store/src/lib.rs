@@ -5,9 +5,11 @@
 mod error;
 mod origin;
 mod store;
+mod transport;
 
 pub use origin::ObjectStoreOrigin;
 pub use store::NestorStore;
+pub use transport::Transport;
 
 #[cfg(test)]
 mod tests {
@@ -15,7 +17,7 @@ mod tests {
     use std::time::Duration;
 
     use bytes::Bytes;
-    use nestor::{BlockSize, CacheConfig, Consistency, Namespace, Nestor};
+    use nestor::{BlockSize, CacheConfig, Consistency, FetchPolicy, Namespace, Nestor};
     use object_store::memory::InMemory;
     use object_store::path::Path;
     use object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutPayload};
@@ -30,7 +32,7 @@ mod tests {
         let ns = Namespace::new("mem", origin)
             .block_size(BlockSize::new(BLOCK as u32).unwrap())
             .consistency(consistency)
-            .hedge(None);
+            .fetch(FetchPolicy::default().hedge(None));
         let nestor = Nestor::builder(CacheConfig::memory(64 << 20))
             .namespace(ns)
             .build()

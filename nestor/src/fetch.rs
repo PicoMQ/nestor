@@ -1,6 +1,4 @@
-//! Origin fetch scheduling. Misses are grouped into contiguous GETs, deduplicated through
-//! `Inflight`, bounded by semaphores, retried with backoff and hedged when a request runs slower
-//! than the namespace's latency estimate.
+//! Origin fetch scheduling: grouped, deduplicated, bounded and driven by the read's `FetchPolicy`.
 
 use std::collections::VecDeque;
 use std::ops::Range;
@@ -17,50 +15,15 @@ use crate::block::group_misses;
 use crate::cache::BlockCache;
 use crate::error::{NestorError, OriginError};
 use crate::inflight::{Inflight, Registration, Slot, SlotHandle};
-use crate::key::{BlockKey, IMMUTABLE_TAG, ObjectKey, block_tag, content_tag};
+use crate::key::{Block, BlockKey, IMMUTABLE_TAG, ObjectKey, block_tag, content_tag};
 use crate::meta::MetaCache;
 use crate::namespace::NamespaceState;
 use crate::origin::{GetOptions, GetResponse, ObjectMeta};
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[cfg_attr(
-    feature = "serde",
-    derive(serde::Deserialize),
-    serde(deny_unknown_fields, default)
-)]
-/// A hedge fires after `factor` times the observed time to first byte, clamped to `min..max`. With
-/// no observation yet it fires after `max`.
-pub struct HedgeConfig {
-    pub factor: f64,
-    #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
-    pub min: Duration,
-    #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
-    pub max: Duration,
-}
-
-impl Default for HedgeConfig {
-    fn default() -> Self {
-        Self {
-            factor: 3.0,
-            min: Duration::from_millis(50),
-            max: Duration::from_secs(2),
-        }
-    }
-}
-
-impl HedgeConfig {
-    pub fn delay(&self, observed: Option<Duration>) -> Duration {
-        match observed {
-            None => self.max,
-            Some(ttfb) => ttfb.mul_f64(self.factor).clamp(self.min, self.max),
-        }
-    }
-}
+use crate::policy::{FetchPolicy, Retry};
 
 const ALPHA_SHIFT: u32 = 3;
 
 #[derive(Debug, Default)]
-/// EWMA of origin time to first byte, `ALPHA_SHIFT` gives an alpha of 1/8.
 pub struct Latency {
     ewma_nanos: AtomicU64,
 }
@@ -96,54 +59,19 @@ impl Latency {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    feature = "serde",
-    derive(serde::Deserialize),
-    serde(deny_unknown_fields, default)
-)]
-pub struct RetryConfig {
-    pub attempts: u32,
-    #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
-    pub base: Duration,
-    #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
-    pub max: Duration,
-}
-
-impl Default for RetryConfig {
-    fn default() -> Self {
-        Self {
-            attempts: 3,
-            base: Duration::from_millis(50),
-            max: Duration::from_secs(2),
-        }
-    }
-}
-
-impl RetryConfig {
-    fn backoff(&self, attempt: u32) -> Duration {
-        self.base
-            .saturating_mul(1u32 << attempt.min(16))
-            .min(self.max)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Foreground reads and background readahead draw from separate semaphores.
 pub(crate) enum Priority {
     Foreground,
     Background,
 }
 
-/// What a fetch needs to know about the object being read, fixed for the life of one read.
 pub(crate) struct ReadCtx {
     pub namespace: Arc<NamespaceState>,
     pub key: ObjectKey,
     pub name: Arc<str>,
     pub tag: u64,
-    /// Sent with origin GETs so a changed object fails fast instead of mixing generations.
     pub if_match: Option<Bytes>,
-    /// Unknown only for bounded reads in immutable namespaces, learned from the first response.
     pub meta: Option<ObjectMeta>,
+    pub policy: FetchPolicy,
 }
 
 impl ReadCtx {
@@ -152,6 +80,7 @@ impl ReadCtx {
         key: ObjectKey,
         name: Arc<str>,
         meta: Option<ObjectMeta>,
+        policy: FetchPolicy,
     ) -> Arc<Self> {
         let consistency = namespace.config.consistency;
         let (tag, if_match) = match &meta {
@@ -172,6 +101,7 @@ impl ReadCtx {
             tag,
             if_match,
             meta,
+            policy,
         })
     }
 
@@ -187,7 +117,6 @@ pub(crate) struct Fetcher {
     foreground: Semaphore,
     background: Semaphore,
     hedges: Semaphore,
-    retry: RetryConfig,
 }
 
 impl Fetcher {
@@ -197,7 +126,6 @@ impl Fetcher {
         origin_concurrency: usize,
         readahead_concurrency: usize,
         hedge_concurrency: usize,
-        retry: RetryConfig,
     ) -> Arc<Self> {
         Arc::new(Self {
             cache,
@@ -206,7 +134,6 @@ impl Fetcher {
             foreground: Semaphore::new(origin_concurrency.max(1)),
             background: Semaphore::new(readahead_concurrency.max(1)),
             hedges: Semaphore::new(hedge_concurrency),
-            retry,
         })
     }
 
@@ -269,31 +196,44 @@ impl Fetcher {
         key: &ObjectKey,
         name: &str,
     ) -> Result<ObjectMeta, NestorError> {
-        ns.metrics.meta_heads.increment(1);
-        match ns.origin.head(name).await {
-            Ok(meta) => {
-                self.meta.put(key.clone(), meta.clone());
-                Ok(meta)
-            }
-            Err(e) => {
-                self.meta.remove(key);
-                Err(e.into())
+        let mut retry = Retry::new(ns.config.fetch);
+        loop {
+            ns.metrics.meta_heads.increment(1);
+            let started = Instant::now();
+            let by = (started + retry.policy().first_byte).min(retry.attempt_deadline());
+            let result = tokio::time::timeout_at(by.into(), ns.origin.head(name))
+                .await
+                .unwrap_or_else(|_| {
+                    ns.metrics.origin_timeouts.increment(1);
+                    Err(OriginError::Timeout(by - started))
+                });
+            match result {
+                Ok(meta) => {
+                    self.meta.put(key.clone(), meta.clone());
+                    return Ok(meta);
+                }
+                Err(e) => {
+                    ns.metrics.origin_errors.increment(1);
+                    if let Err(e) = retry.failed(e).await {
+                        self.meta.remove(key);
+                        return Err(e.into());
+                    }
+                    ns.metrics.origin_retries.increment(1);
+                }
             }
         }
     }
 
-    /// Learns an object's metadata from the GET that a read needs anyway instead of a HEAD. The
-    /// response fills the blocks it covers, a stale `ETag` makes the request conditional so an
-    /// unchanged object costs no body.
     pub async fn probe(
         self: &Arc<Self>,
         ns: &Arc<NamespaceState>,
         name: &Arc<str>,
         indexes: Range<u32>,
         stale: Option<ObjectMeta>,
+        policy: FetchPolicy,
     ) -> Result<Arc<ReadCtx>, NestorError> {
         let key = ObjectKey::new(ns.id, name);
-        let ctx = ReadCtx::new(Arc::clone(ns), key.clone(), Arc::clone(name), None);
+        let ctx = ReadCtx::new(Arc::clone(ns), key.clone(), Arc::clone(name), None, policy);
         let bs = ns.config.block_size;
         let options = GetOptions {
             range: Some(bs.span(indexes.start, indexes.end - indexes.start, None)),
@@ -302,29 +242,55 @@ impl Fetcher {
         };
         let build = |meta: ObjectMeta| {
             self.meta.put(key.clone(), meta.clone());
-            ReadCtx::new(Arc::clone(ns), key.clone(), Arc::clone(name), Some(meta))
+            ReadCtx::new(
+                Arc::clone(ns),
+                key.clone(),
+                Arc::clone(name),
+                Some(meta),
+                policy,
+            )
         };
-        match self.origin_get(&ctx, options).await {
-            Ok(response) => {
-                let ctx = build(response.meta.clone());
-                self.adopt(&ctx, indexes, response);
-                Ok(ctx)
+        let mut retry = Retry::new(policy);
+        loop {
+            let deadline = retry.attempt_deadline();
+            match self.origin_get(&ctx, options.clone(), deadline).await {
+                Ok(response) => {
+                    let ctx = build(response.meta.clone());
+                    self.adopt(&ctx, indexes, response);
+                    return Ok(ctx);
+                }
+                Err(OriginError::NotModified) => {
+                    let meta = stale.ok_or(NestorError::Origin(OriginError::NotModified))?;
+                    return Ok(build(meta));
+                }
+                Err(OriginError::NotFound) => {
+                    self.meta.remove(&key);
+                    return Err(NestorError::NotFound);
+                }
+                Err(e) => {
+                    ns.metrics.origin_errors.increment(1);
+                    let start = bs.offset(indexes.start);
+                    if let Some(meta) = self.past_end(ns, &key, name, start).await {
+                        return Ok(build(meta));
+                    }
+                    retry.failed(e).await?;
+                    ns.metrics.origin_retries.increment(1);
+                }
             }
-            Err(OriginError::NotModified) => {
-                let meta = stale.ok_or(NestorError::Origin(OriginError::NotModified))?;
-                Ok(build(meta))
-            }
-            Err(OriginError::InvalidRange) => Ok(build(self.head(ns, &key, name).await?)),
-            Err(OriginError::NotFound) => {
-                self.meta.remove(&key);
-                Err(NestorError::NotFound)
-            }
-            Err(e) => Err(e.into()),
         }
     }
 
-    /// Hands a probe response to the fetch pipeline for the leading blocks nobody else is already
-    /// fetching. Blocks past the first foreign owner are left to that owner.
+    async fn past_end(
+        &self,
+        ns: &Arc<NamespaceState>,
+        key: &ObjectKey,
+        name: &str,
+        start: u64,
+    ) -> Option<ObjectMeta> {
+        let meta = self.head(ns, key, name).await.ok()?;
+        (start >= meta.size).then_some(meta)
+    }
+
     fn adopt(self: &Arc<Self>, ctx: &Arc<ReadCtx>, indexes: Range<u32>, response: GetResponse) {
         let end = indexes
             .end
@@ -367,13 +333,20 @@ impl Fetcher {
 
         let bs = ctx.namespace.config.block_size;
         let metrics = &ctx.namespace.metrics;
-        let mut size = ctx.size();
-        let mut attempt = 0u32;
+        let mut retry = Retry::new(ctx.policy);
+        let mut meta = ctx.meta.clone();
 
         while let Some(front) = slots.front() {
-            let range = bs.span(front.key().index, slots.len() as u32, size);
-            if range.is_empty() {
-                resolve_all(slots, &Ok(Bytes::new()));
+            let attempt_deadline = retry.attempt_deadline();
+            let range = bs.span(
+                front.key().index,
+                slots.len() as u32,
+                meta.as_ref().map(|m| m.size),
+            );
+            if let Some(known) = &meta
+                && range.is_empty()
+            {
+                resolve_all(slots, &Ok(Block::empty(known.clone())));
                 return;
             }
 
@@ -385,33 +358,29 @@ impl Fetcher {
                     if_match: ctx.if_match.clone(),
                     if_none_match: None,
                 };
-                self.origin_get(&ctx, options).await
+                self.origin_get(&ctx, options, attempt_deadline).await
             };
             match result {
                 Ok(response) => {
-                    size = Some(response.meta.size);
-                    match self.accept(&ctx, response, &mut slots, &range).await {
+                    meta = Some(response.meta.clone());
+                    let accepted = tokio::time::timeout_at(
+                        attempt_deadline.into(),
+                        self.accept(&ctx, response, &mut slots, &range),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        metrics.origin_timeouts.increment(1);
+                        Err(OriginError::Timeout(ctx.policy.attempt))
+                    });
+                    match accepted {
                         Ok(()) => return,
                         Err(e) => {
                             metrics.origin_errors.increment(1);
-                            if !self.retry_or_fail(&ctx, &mut attempt, &mut slots, e).await {
+                            if !Self::retry_or_fail(&ctx, &mut retry, &mut slots, e).await {
                                 return;
                             }
                         }
                     }
-                }
-                Err(OriginError::InvalidRange) => {
-                    match ctx.namespace.origin.head(&ctx.name).await {
-                        Ok(meta) => {
-                            self.meta.put(ctx.key.clone(), meta);
-                            resolve_all(slots, &Ok(Bytes::new()));
-                        }
-                        Err(e) => {
-                            metrics.origin_errors.increment(1);
-                            resolve_all(slots, &Err(Arc::new(e.into())));
-                        }
-                    }
-                    return;
                 }
                 Err(OriginError::NotFound) => {
                     self.meta.remove(&ctx.key);
@@ -426,7 +395,15 @@ impl Fetcher {
                 }
                 Err(e) => {
                     metrics.origin_errors.increment(1);
-                    if !self.retry_or_fail(&ctx, &mut attempt, &mut slots, e).await {
+                    if meta.is_none()
+                        && let Some(known) = self
+                            .past_end(&ctx.namespace, &ctx.key, &ctx.name, range.start)
+                            .await
+                    {
+                        resolve_all(slots, &Ok(Block::empty(known)));
+                        return;
+                    }
+                    if !Self::retry_or_fail(&ctx, &mut retry, &mut slots, e).await {
                         return;
                     }
                 }
@@ -434,8 +411,6 @@ impl Fetcher {
         }
     }
 
-    /// Checks a response against the read's generation and alignment, then streams it into the
-    /// slots. A stale generation fails the slots without retry, a misaligned start is retryable.
     async fn accept(
         &self,
         ctx: &ReadCtx,
@@ -457,38 +432,43 @@ impl Fetcher {
                 got: 0,
             });
         }
-        let size = Some(response.meta.size);
-        self.consume(ctx, response, slots, size).await
+        self.consume(ctx, response, slots).await
     }
 
     async fn retry_or_fail(
-        &self,
         ctx: &ReadCtx,
-        attempt: &mut u32,
+        retry: &mut Retry,
         slots: &mut VecDeque<Slot>,
         error: OriginError,
     ) -> bool {
-        if error.is_retryable() && *attempt < self.retry.attempts {
-            let delay = self.retry.backoff(*attempt);
-            *attempt += 1;
-            ctx.namespace.metrics.origin_retries.increment(1);
-            tokio::time::sleep(delay).await;
-            return true;
+        match retry.failed(error).await {
+            Ok(()) => {
+                ctx.namespace.metrics.origin_retries.increment(1);
+                true
+            }
+            Err(error) => {
+                resolve_all(std::mem::take(slots), &Err(Arc::new(error.into())));
+                false
+            }
         }
-        resolve_all(std::mem::take(slots), &Err(Arc::new(error.into())));
-        false
     }
 
-    /// One origin GET with hedging, counted and timed for the namespace.
     async fn origin_get(
         &self,
         ctx: &ReadCtx,
         options: GetOptions,
+        attempt_deadline: Instant,
     ) -> Result<GetResponse, OriginError> {
         let metrics = &ctx.namespace.metrics;
         metrics.origin_requests.increment(1);
         let started = Instant::now();
-        let result = self.get_hedged(ctx, options).await;
+        let headers_by = (started + ctx.policy.first_byte).min(attempt_deadline);
+        let result = tokio::time::timeout_at(headers_by.into(), self.get_hedged(ctx, options))
+            .await
+            .unwrap_or_else(|_| {
+                metrics.origin_timeouts.increment(1);
+                Err(OriginError::Timeout(headers_by - started))
+            });
         if result.is_ok() {
             let ttfb = started.elapsed();
             ctx.namespace.latency.observe(ttfb);
@@ -504,7 +484,7 @@ impl Fetcher {
     ) -> Result<GetResponse, OriginError> {
         let origin = &ctx.namespace.origin;
         let mut primary = origin.get(&ctx.name, options.clone());
-        let Some(hedge) = &ctx.namespace.config.hedge else {
+        let Some(hedge) = &ctx.policy.hedge else {
             return primary.await;
         };
         let delay = hedge.delay(ctx.namespace.latency.get());
@@ -532,10 +512,11 @@ impl Fetcher {
         ctx: &ReadCtx,
         response: GetResponse,
         slots: &mut VecDeque<Slot>,
-        size: Option<u64>,
     ) -> Result<(), OriginError> {
         let bs = ctx.namespace.config.block_size;
         let metrics = &ctx.namespace.metrics;
+        let meta = response.meta;
+        let size = Some(meta.size);
         let mut body = response.body;
         let mut buf = BytesMut::new();
 
@@ -543,7 +524,7 @@ impl Fetcher {
             let expected = bs.block_range(front.key().index, size).count();
             if expected == 0 {
                 let slot = slots.pop_front().expect("front exists");
-                slot.resolve(Ok(Bytes::new()));
+                slot.resolve(Ok(Block::empty(meta.clone())));
                 continue;
             }
             let Some(chunk) = body.next().await else {
@@ -574,6 +555,7 @@ impl Fetcher {
                 };
                 let slot = slots.pop_front().expect("front exists");
                 metrics.origin_bytes.increment(block.len() as u64);
+                let block = Block::new(meta.clone(), block);
                 self.cache.insert(slot.key().clone(), block.clone());
                 slot.resolve(Ok(block));
             }
@@ -582,7 +564,7 @@ impl Fetcher {
     }
 }
 
-fn resolve_all(slots: VecDeque<Slot>, result: &Result<Bytes, Arc<NestorError>>) {
+fn resolve_all(slots: VecDeque<Slot>, result: &Result<Block, Arc<NestorError>>) {
     for slot in slots {
         slot.resolve(result.clone());
     }
@@ -600,17 +582,5 @@ mod tests {
         }
         let v = l.get().unwrap();
         assert!(v >= Duration::from_millis(39) && v <= Duration::from_millis(41));
-    }
-
-    #[test]
-    fn delay_is_clamped() {
-        let cfg = HedgeConfig::default();
-        assert_eq!(cfg.delay(None), cfg.max);
-        assert_eq!(cfg.delay(Some(Duration::from_millis(1))), cfg.min);
-        assert_eq!(cfg.delay(Some(Duration::from_secs(10))), cfg.max);
-        assert_eq!(
-            cfg.delay(Some(Duration::from_millis(100))),
-            Duration::from_millis(300)
-        );
     }
 }

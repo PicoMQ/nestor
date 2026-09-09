@@ -10,7 +10,7 @@ repository.workspace = true
 [dependencies]
 nestor = { workspace = true }
 
-object_store = { workspace = true }
+object_store = { workspace = true, features = ["cloud-base"] }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }

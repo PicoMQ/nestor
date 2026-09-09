@@ -4,6 +4,7 @@
 use std::time::Duration;
 
 use nestor::{BlockSize, HedgeConfig};
+use nestor_store::Transport;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClusterConfig {
@@ -14,6 +15,7 @@ pub struct ClusterConfig {
     pub hedge: Option<HedgeConfig>,
     pub tls: bool,
     pub credentials: Option<Credentials>,
+    pub transport: Transport,
 }
 
 impl Default for ClusterConfig {
@@ -26,6 +28,7 @@ impl Default for ClusterConfig {
             hedge: Some(HedgeConfig::default()),
             tls: false,
             credentials: None,
+            transport: Transport::default(),
         }
     }
 }

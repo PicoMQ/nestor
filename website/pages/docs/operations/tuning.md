@@ -42,6 +42,18 @@ Disk `region_size` trades reclaim granularity for write size. `64` MiB is fine f
 
 Hedging adds at most `hedge_concurrency` extra requests at any moment and normally far fewer. With the default `factor = 3.0` a hedge fires only for requests three times slower than the running average. Lower the factor toward `2.0` on origins with a fat tail, raise it or disable hedging on origins that charge per request and have none.
 
+## Fetch timeouts
+
+`[buckets.fetch]` defaults are loose, `5s` to first byte and `60s` per fetch, so a slow origin degrades rather than fails.
+
+| Setting | Set to |
+| --- | --- |
+| `deadline` | The reader's own latency budget |
+| `first_byte` | A few times the origin's p99 |
+| `attempt` | At least `fetch_window` blocks at the origin's throughput |
+
+`nestor_origin_timeouts_total` rising while `nestor_origin_ttfb_seconds` is flat means `first_byte` is below the origin's tail, not that the origin got slower.
+
 ## Cluster
 
 `cluster.block_size` should equal `buckets.block_size` on the nodes, or be a small multiple of it. Larger routing blocks mean fewer node requests per read and less parallelism per object. `load_limit` should be high enough that a node is only ever skipped when it is truly saturated, spilled blocks are cached twice. `down_for` shorter than the time a node takes to restart causes reconnect churn, longer delays recovery.

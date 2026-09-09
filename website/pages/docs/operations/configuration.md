@@ -31,6 +31,7 @@ Serving anonymous plaintext on a non-loopback address is allowed and logs a warn
 | `region` | `us-east-1` | Used in the SigV4 scope of forwarded and fetched requests. |
 | `virtual_hosted` | `false` | Address the origin as `bucket.endpoint` instead of `endpoint/bucket`. |
 | `credentials` | `{ source = "default" }` | How Nestor authenticates to the origin. |
+| `connect_timeout` | `5s` | TCP and TLS setup toward the origin. Retries and request timeouts are `[buckets.fetch]`. |
 
 Credential sources:
 
@@ -57,7 +58,6 @@ Client credentials and origin credentials are independent. A deployment usually 
 | `origin_concurrency` | `64` | Foreground origin `GET`s in flight. |
 | `readahead_concurrency` | `16` | Background origin `GET`s in flight. |
 | `hedge_concurrency` | `16` | Hedge requests in flight. |
-| `retry` | `{ attempts = 3, base = "50ms", max = "2s" }` | Backoff for I/O errors and short reads. |
 
 ## `[cache.disk]`
 
@@ -83,8 +83,21 @@ The caching policy every bucket gets as a namespace.
 | `read_window` | `16` | Blocks in flight per stream. |
 | `consistency` | `{ mode = "etag", ttl = "60s" }` | Or `{ mode = "immutable" }`. |
 | `readahead` | `8` | Blocks prefetched on sequential access. `0` disables. |
-| `hedge` | `{ factor = 3.0, min = "50ms", max = "2s" }` | Tail hedging against the origin. Omit the key to disable. |
 | `populate_max` | `16 MiB` | Largest `PUT` body inserted into the cache on the way through. |
+
+## `[buckets.fetch]`
+
+How a miss goes to the origin, see [Fetch policy](/docs/design/fetches#fetch-policy). A `GET` can override any key with the `X-Nestor-Fetch` header.
+
+| Key | Default | Purpose |
+| --- | --- | --- |
+| `attempts` | `3` | Tries per fetch, including the first. |
+| `backoff` | `50ms` | Delay before the first retry, doubling per attempt. |
+| `backoff_max` | `2s` | Cap on the delay. |
+| `first_byte` | `5s` | Time for one attempt to return headers. |
+| `attempt` | `30s` | Time for one attempt including its body. |
+| `deadline` | `60s` | Time for the fetch as a whole. |
+| `hedge` | `{ factor = 3.0, min = "50ms", max = "2s" }` | Tail hedging against the origin. `false` disables. |
 
 ## `[cluster]`
 
@@ -100,6 +113,7 @@ Absent by default. Present turns this binary into a gateway that reads from a cl
 | `load_limit` | `256` | In-flight requests per node before spilling to the next choice. |
 | `down_for` | `5s` | How long a node is skipped after a connection failure. |
 | `hedge` | `{ factor = 3.0, min = "50ms", max = "2s" }` | Hedging across nodes. |
+| `connect_timeout` | `5s` | TCP and TLS setup toward a node. |
 | `tls` | `false` | Use `https` toward nodes. |
 | `credentials` | unset | `{ access_key, secret_key }` matching the nodes' `[auth]`. |
 | `warm_on_write` | `false` | After a `PUT`, fetch each block on its owning node. |

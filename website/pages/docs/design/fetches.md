@@ -51,23 +51,45 @@ Three semaphores bound outstanding origin work for the whole instance.
 
 Foreground and background pools are separate so a burst of readahead cannot starve a cache miss a caller is waiting on. Hedges take from their own pool and when it is exhausted the primary request is awaited, so hedging degrades to nothing rather than amplifying load on an origin that is already struggling.
 
-## Hedging
+## Fetch policy
 
-The origin's time to first byte is tracked per namespace as an exponentially weighted moving average. A fetch that has not answered after `factor` times that average, clamped to `[min, max]`, issues a second identical request and takes whichever answers first.
+One `FetchPolicy` per namespace decides how a miss goes to the origin. A read overrides it with `ReadOptions` in the library or `X-Nestor-Fetch` on the [endpoint](/docs/design/endpoint#fetch-overrides). A fetch group runs under the policy of the read that opened it.
 
-| Setting | Default |
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `attempts` | `3` | Tries per fetch, including the first |
+| `backoff`, `backoff_max` | `50ms`, `2s` | Delay before a retry, doubling per attempt |
+| `first_byte` | `5s` | Time for one attempt to return headers |
+| `attempt` | `30s` | Time for one attempt to deliver its body |
+| `deadline` | `60s` | The fetch as a whole, across attempts and backoff |
+| `hedge` | `{ factor = 3.0, min = "50ms", max = "2s" }` | Secondary request timing, `false` disables |
+
+The `object_store` client under `nestor-store` runs with its own retries and request timeout off (`Transport`), so this is the only policy in effect and `nestor_origin_retries_total` counts every retry.
+
+### Timeouts
+
+| Timeout | Catches | Scope |
+| --- | --- | --- |
+| `first_byte` | Hung connection, origin that accepted and stalled | Headers of one attempt, hedge included |
+| `attempt` | Body that trickles while holding a concurrency permit | One attempt, headers and body |
+| `deadline` | Worst case a reader waits | All attempts and backoff, a retry runs only if its backoff still fits |
+
+A timeout is `OriginError::Timeout` and retryable. Blocks are inserted only once complete, so an attempt cut off mid-body leaves nothing partial and the retry resumes at the first unfinished block.
+
+### Hedging
+
+Time to first byte is tracked per namespace as an EWMA. A request unanswered after `factor` times that average, clamped to `[min, max]`, gets a second identical request and the first answer wins. A `20` ms origin hedges at `60` ms. Before any observation the delay is `max`. The cluster client additionally hedges across nodes, see [Cluster](/docs/design/cluster).
+
+### Retries
+
+| Error | Retried |
 | --- | --- |
-| `factor` | `3.0` |
-| `min` | `50ms` |
-| `max` | `2s` |
+| I/O, short read, timeout | Yes, with backoff |
+| `404`, precondition failed | No, they are answers |
 
-With a typical `20` ms origin the hedge fires at `60` ms, which catches the tail without touching the median. Before any observation the delay is `max`. Hedging is per namespace and `None` disables it. The endpoint and cluster gateway hedge with the same mechanism, the cluster client additionally hedges across nodes, see [Cluster](/docs/design/cluster).
+A `GET` that fails while the object's size is unknown may have asked past the end, and origins report that like any other error. One `HEAD` settles it: a range starting at or beyond the size resolves to empty blocks, anything else goes to the retry policy with the original error.
 
-## Retries
-
-I/O errors and short reads are retried with exponential backoff, `3` attempts with a `50` ms base and a `2` s cap by default. `404`, precondition failures and invalid ranges are not retried, they are answers. A fetch group that exhausts its retries fails every reader waiting on it with the origin's error.
-
-A short read is a body that ended before the requested range did. Since blocks are only inserted once complete, a truncated response never leaves a partial block in the cache.
+Out of attempts fails the waiting readers with the last error, out of deadline fails them with a timeout. A short read is a body that ended before the requested range did.
 
 ## Readahead
 
@@ -87,4 +109,4 @@ pub trait Origin: Send + Sync + 'static {
 }
 ```
 
-`GetOptions` carries an optional byte range plus `If-Match` and `If-None-Match`. `GetResponse` carries the object metadata, the range actually returned and a body stream. `OriginError` distinguishes not found, precondition failed, not modified, invalid range, short read and I/O so the fetcher can decide what to retry. `nestor-store` implements it over `object_store`, `nestor-client` over a cluster of nodes, and `MemoryOrigin` in the `nestor` crate is an in-process origin with injectable latency and failures for tests.
+`GetOptions` carries an optional byte range plus `If-Match` and `If-None-Match`. `GetResponse` carries the object metadata, the range actually returned and a body stream. `OriginError` distinguishes not found, precondition failed, not modified, short read, timeout and I/O so the fetcher can decide what to retry. `nestor-store` implements it over `object_store`, `nestor-client` over a cluster of nodes, and `MemoryOrigin` in the `nestor` crate is an in-process origin with injectable latency and failures for tests.

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use http::Uri;
 use http::uri::{Authority, Scheme};
 use nestor::Origin;
-use nestor_store::ObjectStoreOrigin;
+use nestor_store::{ObjectStoreOrigin, Transport};
 use object_store::StaticCredentialProvider;
 use object_store::aws::{AmazonS3Builder, AwsCredential, AwsCredentialProvider};
 
@@ -32,6 +32,7 @@ pub struct OriginConfig {
     pub region: String,
     pub credentials: Option<AwsCredentialProvider>,
     pub virtual_hosted: bool,
+    pub transport: Transport,
 }
 
 impl OriginConfig {
@@ -41,6 +42,7 @@ impl OriginConfig {
             region: region.into(),
             credentials: None,
             virtual_hosted: false,
+            transport: Transport::default(),
         }
     }
 
@@ -73,6 +75,11 @@ impl OriginConfig {
         self
     }
 
+    pub fn with_transport(mut self, transport: Transport) -> Self {
+        self.transport = transport;
+        self
+    }
+
     pub fn scheme(&self) -> &Scheme {
         self.endpoint.scheme().unwrap_or(&Scheme::HTTPS)
     }
@@ -86,7 +93,8 @@ impl OriginConfig {
             .with_bucket_name(bucket)
             .with_region(self.region.clone())
             .with_endpoint(self.endpoint.to_string().trim_end_matches('/'))
-            .with_allow_http(true)
+            .with_client_options(self.transport.client_options())
+            .with_retry(self.transport.retry_config())
             .with_virtual_hosted_style_request(self.virtual_hosted);
         builder = match &self.credentials {
             Some(provider) => builder.with_credentials(Arc::clone(provider)),
@@ -106,6 +114,7 @@ impl std::fmt::Debug for OriginConfig {
             .field("region", &self.region)
             .field("credentials", &self.credentials.is_some())
             .field("virtual_hosted", &self.virtual_hosted)
+            .field("transport", &self.transport)
             .finish()
     }
 }

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use nestor::{BlockSize, CacheConfig, Consistency, MemoryOrigin, Namespace, Nestor};
+use nestor::{BlockSize, CacheConfig, Consistency, FetchPolicy, MemoryOrigin, Namespace, Nestor};
 use proptest::prelude::*;
 
 fn pattern(len: usize) -> Bytes {
@@ -34,7 +34,7 @@ fn read_matches(
             .fetch_window(fetch_window)
             .read_window(fetch_window * 2)
             .consistency(Consistency::Immutable)
-            .hedge(None);
+            .fetch(FetchPolicy::default().hedge(None));
         let nestor = Nestor::builder(CacheConfig::memory(256 << 20))
             .namespace(ns)
             .build()

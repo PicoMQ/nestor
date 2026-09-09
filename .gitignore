@@ -3,9 +3,16 @@
 *.profraw
 *.profdata
 
+/data/
+
 **/proptest-regressions/
 
-/data/
+nestor-bench/reports/
+
+website/node_modules/
+website/.vitepress/cache/
+website/.vitepress/dist/
+website/.vitepress/.temp/
 
 .env
 .env.*
@@ -18,7 +25,4 @@
 *~
 
 .DS_Store
-
-website/node_modules/
-website/.vitepress/cache/
-website/.vitepress/dist/
+Thumbs.db

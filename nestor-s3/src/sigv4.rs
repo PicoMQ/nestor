@@ -191,8 +191,6 @@ struct SigningKey {
     key: [u8; 32],
 }
 
-/// Derived signing keys. A key is fixed for a secret, day and region, so the four HMACs of
-/// `signing_key` run once per day instead of once per request.
 #[derive(Default)]
 pub struct SigningKeys {
     entries: Mutex<Vec<SigningKey>>,
@@ -303,8 +301,6 @@ impl Authorization {
 }
 
 impl SigningKeys {
-    /// Signs `headers` in place with an unsigned payload, the way the forwarder re-signs requests
-    /// for the origin. The `Host` header must already be set.
     pub fn sign(
         &self,
         method: &Method,

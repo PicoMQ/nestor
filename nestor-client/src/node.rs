@@ -8,7 +8,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use nestor::{Latency, Origin};
-use nestor_store::ObjectStoreOrigin;
+use nestor_store::{ObjectStoreOrigin, Transport};
 use object_store::StaticCredentialProvider;
 use object_store::aws::{AmazonS3Builder, AwsCredential, AwsCredentialProvider};
 
@@ -23,6 +23,7 @@ pub(crate) struct Node {
     seed: u64,
     endpoint: String,
     credentials: Option<AwsCredentialProvider>,
+    transport: Transport,
     load_limit: usize,
     inflight: AtomicUsize,
     epoch: Instant,
@@ -46,6 +47,7 @@ impl Node {
             seed: router::seed(&addr),
             endpoint: format!("{scheme}://{addr}"),
             credentials,
+            transport: config.transport,
             load_limit: config.load_limit.max(1),
             inflight: AtomicUsize::new(0),
             epoch: Instant::now(),
@@ -120,7 +122,8 @@ impl Node {
             .with_bucket_name(bucket.as_ref())
             .with_region(REGION)
             .with_endpoint(&self.endpoint)
-            .with_allow_http(true);
+            .with_client_options(self.transport.client_options())
+            .with_retry(self.transport.retry_config());
         builder = match &self.credentials {
             Some(provider) => builder.with_credentials(Arc::clone(provider)),
             None => builder.with_skip_signature(true),

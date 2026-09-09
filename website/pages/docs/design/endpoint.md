@@ -45,6 +45,31 @@ A `GET` or `HEAD` on an object key with no query string is served from cache. Th
 
 Everything else is forwarded: bucket operations, listings, `PUT`, `DELETE`, multipart uploads, and any object `GET` with a query string, which includes `?versionId`, `?partNumber` and presigned URLs. Forwarding streams both directions without buffering.
 
+## Fetch overrides
+
+`X-Nestor-Fetch` overrides the bucket's [fetch policy](/docs/design/fetches#fetch-policy) for one `GET`. Space separated `key=value` pairs, durations in `humantime` form.
+
+```http
+GET /segments/topic/0/000123.log
+X-Nestor-Fetch: attempts=1 first_byte=500ms deadline=2s hedge=off
+```
+
+| Key | Value |
+| --- | --- |
+| `attempts` | Tries including the first |
+| `backoff`, `backoff_max` | Retry delay and its cap |
+| `first_byte` | Time to headers per attempt |
+| `attempt` | Time per attempt including body |
+| `deadline` | Time for the whole fetch |
+| `hedge` | `on` or `off` |
+
+| Outcome | Response |
+| --- | --- |
+| Malformed header | `400 InvalidRequest` |
+| Origin exceeds the policy | `504 GatewayTimeout` |
+
+Signature verification follows the client's `SignedHeaders`, signed or not the header is honoured.
+
 ## Writes
 
 A write that the origin accepts updates the cache before the response is returned to the client, so the client's next read is consistent with its own write regardless of the namespace TTL.

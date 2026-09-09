@@ -25,7 +25,10 @@ impl Cluster {
         let start = options.range.as_ref().map_or(0, |r| r.start);
         let limit = options.range.as_ref().map_or(u64::MAX, |r| r.end);
         if start >= limit {
-            return Err(OriginError::InvalidRange);
+            return Err(OriginError::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "empty range",
+            )));
         }
 
         let first_index = block_size.index(start);

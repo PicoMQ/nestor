@@ -21,6 +21,7 @@ Every series carries a `namespace` label. In the S3 endpoint that is the bucket 
 | `nestor_origin_bytes_total` | counter | Bytes received from the origin. |
 | `nestor_origin_errors_total` | counter | Origin `GET`s that failed, before retry. |
 | `nestor_origin_retries_total` | counter | Retries issued. |
+| `nestor_origin_timeouts_total` | counter | Attempts cut off by `first_byte` or `attempt`. |
 | `nestor_origin_ttfb_seconds` | histogram | Time to first byte per origin `GET`. |
 | `nestor_hedges_total` | counter | Secondary requests issued. |
 | `nestor_hedge_wins_total` | counter | Secondary requests that answered before the primary. |

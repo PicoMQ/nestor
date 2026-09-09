@@ -3,7 +3,6 @@
 
 use std::path::PathBuf;
 
-use bytes::Bytes;
 use foyer::{
     BlockEngineConfig, Cache, CacheBuilder, CacheProperties, Compression, DeviceBuilder,
     FsDeviceBuilder, HybridCache, HybridCacheBuilder, HybridCachePolicy, LruConfig, RecoverMode,
@@ -11,12 +10,11 @@ use foyer::{
 };
 use mixtrics::metrics::BoxedRegistry;
 
-use crate::key::{BlockKey, ObjectKey};
+use crate::key::{Block, BlockKey, ObjectKey};
 
-pub type BlockCache = HybridCache<BlockKey, Bytes>;
+pub type BlockCache = HybridCache<BlockKey, Block>;
 
 const MIB: usize = 1024 * 1024;
-/// Each RAM shard evicts on its own, so a shard has to hold a good number of blocks.
 const MIN_SHARD_BYTES: usize = 32 * MIB;
 const MAX_BUFFER_POOL: usize = 256 * MIB;
 
@@ -27,7 +25,6 @@ pub struct DiskConfig {
     pub region_size: usize,
     pub flushers: usize,
     pub reclaimers: usize,
-    /// Write buffer shared by the flushers, derived from capacity and region size when unset.
     pub buffer_pool_size: Option<usize>,
     pub direct_io: bool,
     pub compression: Compression,
@@ -85,7 +82,6 @@ impl CacheConfig {
     }
 }
 
-/// Two shards per core for contention, capped so no shard falls under `MIN_SHARD_BYTES`.
 fn default_shards(memory: usize) -> usize {
     let cores = std::thread::available_parallelism().map_or(8, |n| n.get());
     (cores * 2).min(memory / MIN_SHARD_BYTES).max(1)
@@ -110,8 +106,8 @@ pub async fn build(
         .memory(config.memory)
         .with_shards(config.shards)
         .with_eviction_config(S3FifoConfig::default())
-        .with_weighter(|key: &BlockKey, value: &Bytes| {
-            value.len() + key.object.len() + std::mem::size_of::<BlockKey>()
+        .with_weighter(|key: &BlockKey, block: &Block| {
+            block.weight() + key.object.len() + std::mem::size_of::<BlockKey>()
         });
 
     let storage = memory.storage();
@@ -139,7 +135,6 @@ pub async fn build(
     storage.with_io_engine_config(io_engine()).build().await
 }
 
-/// `io_uring` when the kernel and seccomp profile allow it, `psync` otherwise.
 #[cfg(target_os = "linux")]
 fn io_engine() -> Box<dyn foyer::IoEngineConfig> {
     match io_uring::IoUring::new(2) {
