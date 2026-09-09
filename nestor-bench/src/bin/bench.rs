@@ -33,6 +33,8 @@ enum Command {
         /// S3 endpoint of the origin.
         #[arg(long, env = "BENCH_ORIGIN", default_value = "http://127.0.0.1:19200")]
         origin: String,
+        #[arg(long, env = "BENCH_BUCKET", default_value = nestor_e2e::BUCKET)]
+        bucket: String,
         #[arg(long, default_value_t = 8)]
         concurrency: usize,
         /// Rewrite objects that already exist.
@@ -100,6 +102,8 @@ struct RunArgs {
     /// S3 endpoint of the origin, the proxy forwards here.
     #[arg(long, env = "BENCH_ORIGIN", default_value = "http://127.0.0.1:19200")]
     origin: String,
+    #[arg(long, env = "BENCH_BUCKET", default_value = nestor_e2e::BUCKET)]
+    bucket: String,
     /// Where the in-process proxy listens. Containers reach it as host.docker.internal.
     #[arg(long, default_value = "0.0.0.0:19300")]
     proxy_listen: SocketAddr,
@@ -182,6 +186,26 @@ fn parse_duration(text: &str) -> Result<Duration, String> {
     humantime::parse_duration(text).map_err(|e| e.to_string())
 }
 
+fn direct_origin(url: &str) -> bool {
+    url.starts_with("https://")
+}
+
+fn store(origin: &str, bucket: &str) -> eyre::Result<Arc<dyn ObjectStore>> {
+    if direct_origin(origin) {
+        Ok(s3::aws(origin, bucket).wrap_err("resolving AWS credentials")?)
+    } else {
+        Ok(s3::client_at(origin, bucket))
+    }
+}
+
+fn origin_store(origin: &str, bucket: &str) -> eyre::Result<Arc<dyn ObjectStore>> {
+    if direct_origin(origin) {
+        Ok(s3::aws(origin, bucket).wrap_err("resolving AWS credentials")?)
+    } else {
+        Ok(s3::origin_at(origin, bucket))
+    }
+}
+
 fn authority(url: &str) -> eyre::Result<String> {
     let uri: http::Uri = url.parse().wrap_err_with(|| format!("bad url {url}"))?;
     uri.authority()
@@ -202,14 +226,16 @@ async fn main() -> eyre::Result<()> {
         Command::Dataset {
             dataset,
             origin,
+            bucket,
             concurrency,
             force,
         } => {
             let dataset = Dataset::generate(dataset.into());
-            let store: Arc<dyn ObjectStore> = s3::client(&origin);
+            let store = store(&origin, &bucket)?;
             tracing::info!(
                 objects = dataset.objects.len(),
                 mib = dataset.total_bytes() / (1024 * 1024),
+                bucket,
                 "uploading"
             );
             let uploaded = dataset.upload(store, concurrency, force).await?;
@@ -237,24 +263,23 @@ async fn main() -> eyre::Result<()> {
     Ok(())
 }
 
-async fn run(args: RunArgs) -> eyre::Result<()> {
-    let dataset = Arc::new(Dataset::generate(args.dataset.clone().into()));
-    let params = Params {
-        consumers: args.workload.consumers,
-        duration: args.workload.duration,
-        hot_set: args.workload.hot_set,
-        stagger: args.workload.stagger,
-        block: args.cache.block,
-    };
+struct Opened {
+    target: Arc<dyn Target>,
+    config: serde_json::Value,
+    library: Option<Arc<Library>>,
+    stack: Option<Stack>,
+}
 
-    let proxy = Proxy::new(authority(&args.origin)?);
-    let serving = tokio::spawn(Arc::clone(&proxy).serve(args.proxy_listen));
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    eyre::ensure!(!serving.is_finished(), "proxy failed to start");
+fn origin_client(args: &RunArgs, direct: bool) -> eyre::Result<Arc<dyn ObjectStore>> {
+    if direct {
+        origin_store(&args.origin, &args.bucket)
+    } else {
+        Ok(s3::origin(&args.proxy_url))
+    }
+}
 
-    let mut library = None;
-    let mut stack = None;
-    let (target, config): (Arc<dyn Target>, serde_json::Value) = match args.target {
+async fn open_target(args: &RunArgs, direct: bool) -> eyre::Result<Opened> {
+    match args.target {
         TargetKind::Library => {
             let cache = &args.cache;
             let config = LibraryConfig {
@@ -268,12 +293,16 @@ async fn run(args: RunArgs) -> eyre::Result<()> {
                 fetch: FetchPolicy::default().with(&cache.fetch),
                 immutable: !cache.etag,
             };
-            let lib = Arc::new(Library::start(&config, s3::origin(&args.proxy_url)).await?);
-            library = Some(Arc::clone(&lib));
-            (lib, serde_json::to_value(&config)?)
+            let lib = Arc::new(Library::start(&config, origin_client(args, direct)?).await?);
+            Ok(Opened {
+                target: Arc::clone(&lib) as Arc<dyn Target>,
+                config: serde_json::to_value(&config)?,
+                library: Some(lib),
+                stack: None,
+            })
         }
         TargetKind::Endpoint => {
-            stack = args.compose.clone().map(|compose| Stack {
+            let stack = args.compose.clone().map(|compose| Stack {
                 compose,
                 service: "nestor".into(),
                 health: format!("{}/-/health", args.endpoint),
@@ -284,42 +313,75 @@ async fn run(args: RunArgs) -> eyre::Result<()> {
                 Some(args.endpoint_metrics.clone()),
                 Some(args.container.clone()),
             );
-            (
-                Arc::new(target),
-                serde_json::json!({ "endpoint": args.endpoint, "block": args.cache.block }),
-            )
+            Ok(Opened {
+                target: Arc::new(target),
+                config: serde_json::json!({ "endpoint": args.endpoint, "block": args.cache.block }),
+                library: None,
+                stack,
+            })
         }
-        TargetKind::Origin => (
-            Arc::new(Endpoint::new(
+        TargetKind::Origin => Ok(Opened {
+            target: Arc::new(Endpoint::new(
                 "origin",
-                s3::origin(&args.proxy_url),
+                origin_client(args, direct)?,
                 None,
                 None,
             )),
-            serde_json::json!({ "origin": args.origin }),
-        ),
+            config: serde_json::json!({ "origin": args.origin, "bucket": args.bucket }),
+            library: None,
+            stack: None,
+        }),
+    }
+}
+
+async fn run(args: RunArgs) -> eyre::Result<()> {
+    let dataset = Arc::new(Dataset::generate(args.dataset.clone().into()));
+    let params = Params {
+        consumers: args.workload.consumers,
+        duration: args.workload.duration,
+        hot_set: args.workload.hot_set,
+        stagger: args.workload.stagger,
+        block: args.cache.block,
     };
 
+    let direct = direct_origin(&args.origin);
+    let proxy = Proxy::new(if direct {
+        String::from("127.0.0.1:9")
+    } else {
+        authority(&args.origin)?
+    });
+    let serving = if direct {
+        None
+    } else {
+        let serving = tokio::spawn(Arc::clone(&proxy).serve(args.proxy_listen));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        eyre::ensure!(!serving.is_finished(), "proxy failed to start");
+        Some(serving)
+    };
+
+    let opened = open_target(&args, direct).await?;
     let runner = Runner {
-        target: Arc::clone(&target),
+        target: Arc::clone(&opened.target),
         proxy: Arc::clone(&proxy),
         dataset: Arc::clone(&dataset),
         verify: args.verify,
-        stack,
+        stack: opened.stack,
     };
     let phases = args.scenario.phases(&dataset, &params);
     let outcome = runner.run(phases).await?;
-    if let Some(lib) = library {
+    if let Some(lib) = opened.library {
         lib.close().await?;
     }
-    serving.abort();
+    if let Some(serving) = serving {
+        serving.abort();
+    }
 
     let mut report = Report {
-        target: target.name().to_owned(),
+        target: opened.target.name().to_owned(),
         scenario: args.scenario,
         dataset: dataset.params.clone(),
         params: params.clone(),
-        config,
+        config: opened.config,
         started_unix: SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs()),

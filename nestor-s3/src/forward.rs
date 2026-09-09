@@ -125,14 +125,20 @@ impl Forwarder {
     }
 
     fn upstream_uri(&self, target: &Target, raw_query: &str) -> Result<(Uri, String), S3Error> {
-        let authority = self
-            .origin
-            .authority()
-            .ok_or_else(|| S3Error::internal("origin endpoint has no authority"))?;
-        let (host, mut path) = match (&target.bucket, self.origin.virtual_hosted) {
-            (Some(bucket), true) => (format!("{bucket}.{authority}"), String::from("/")),
-            (Some(bucket), false) => (authority.to_string(), format!("/{bucket}")),
-            (None, _) => (authority.to_string(), String::from("/")),
+        let (host, mut path) = if let Some(bucket) = &target.bucket {
+            let host = self.origin.bucket_host(bucket)?;
+            let path = if self.origin.virtual_hosted {
+                String::from("/")
+            } else {
+                format!("/{bucket}")
+            };
+            (host, path)
+        } else {
+            let authority = self
+                .origin
+                .authority()
+                .ok_or_else(|| S3Error::internal("origin endpoint has no authority"))?;
+            (authority.to_string(), String::from("/"))
         };
         if let Some(key) = &target.key {
             if !path.ends_with('/') {
