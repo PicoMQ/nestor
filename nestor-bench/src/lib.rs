@@ -5,5 +5,6 @@ pub mod dataset;
 pub mod proxy;
 pub mod report;
 pub mod run;
+pub mod service;
 pub mod target;
 pub mod workload;

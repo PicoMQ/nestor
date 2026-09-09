@@ -265,24 +265,24 @@ impl Scenario {
         if first.nestor.is_none() {
             return;
         }
-        let origin = |phase: &PhaseReport| phase.origin;
+        let requests = |phase: &PhaseReport| phase.origin_requests();
         match self {
             Self::ColdOpen => expect(
-                origin(first).requests <= 2,
-                format!("cold open took {} origin requests", origin(first).requests),
+                requests(first) <= 2,
+                format!("cold open took {} origin requests", requests(first)),
             ),
             Self::Sequential | Self::Fanout => {
                 let size = ds.objects[0].size;
-                let fetched = origin(first).bytes;
+                let fetched = first.origin_bytes();
                 expect(
                     fetched >= size && fetched <= size + size / 20,
                     format!("fetched {fetched} bytes for a {size} byte object"),
                 );
                 expect(
-                    origin(first).requests <= blocks(size, p.block),
+                    requests(first) <= blocks(size, p.block),
                     format!(
                         "{} origin requests for {} blocks",
-                        origin(first).requests,
+                        requests(first),
                         blocks(size, p.block)
                     ),
                 );
@@ -290,10 +290,10 @@ impl Scenario {
             Self::FanoutStaggered => {
                 if let Some(second) = report.phases.get(1) {
                     expect(
-                        origin(second).requests == 0,
+                        requests(second) == 0,
                         format!(
                             "staggered reader caused {} origin requests",
-                            origin(second).requests
+                            requests(second)
                         ),
                     );
                 }
@@ -306,15 +306,12 @@ impl Scenario {
                     .map(|o| blocks(o.size, p.block))
                     .sum();
                 expect(
-                    origin(first).requests <= limit,
-                    format!(
-                        "{} origin requests for {limit} blocks",
-                        origin(first).requests
-                    ),
+                    requests(first) <= limit,
+                    format!("{} origin requests for {limit} blocks", requests(first)),
                 );
             }
             Self::Errors => {
-                let injected = origin(first).injected;
+                let injected = first.origin.map_or(0, |o| o.injected);
                 expect(injected > 0, "no failures were injected".into());
                 expect(
                     first.errors * 20 <= injected,
@@ -326,12 +323,12 @@ impl Scenario {
             }
             Self::Restart => {
                 if let Some(recovered) = report.phases.get(1) {
-                    let warm = origin(first).requests;
+                    let warm = requests(first);
                     expect(
-                        origin(recovered).requests * 5 <= warm,
+                        requests(recovered) * 5 <= warm,
                         format!(
                             "{} origin requests after restart, {warm} while warming",
-                            origin(recovered).requests
+                            requests(recovered)
                         ),
                     );
                 }

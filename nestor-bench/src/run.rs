@@ -1,7 +1,6 @@
 //! Runs phases against a target: one task per consumer replaying its events, counters snapshotted
 //! at phase boundaries, RSS sampled throughout.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -9,64 +8,23 @@ use std::time::{Duration, Instant};
 use eyre::WrapErr;
 use futures::StreamExt;
 use hdrhistogram::Histogram;
-use nestor_e2e::wait;
-use tokio::process::Command;
 use tokio::task::JoinSet;
 
 use crate::dataset::{Dataset, fill};
 use crate::proxy::{Faults, Proxy};
 use crate::report::{Latency, PhaseReport, histogram};
+use crate::service::Service;
 use crate::target::Target;
 use crate::workload::{Action, Event, Op, Phase};
 
-#[derive(Debug, Clone)]
-pub struct Stack {
-    pub compose: PathBuf,
-    pub service: String,
-    pub health: String,
-}
-
-impl Stack {
-    async fn restart(&self) -> eyre::Result<()> {
-        self.compose(&["stop"]).await?;
-        self.compose(&["start"]).await?;
-        wait::healthy(&self.health, Duration::from_secs(120)).await;
-        Ok(())
-    }
-
-    async fn recreate(&self) -> eyre::Result<()> {
-        self.compose(&["rm", "--stop", "--force", "--volumes"])
-            .await?;
-        self.compose(&["up", "--detach", "--wait"]).await?;
-        wait::healthy(&self.health, Duration::from_secs(120)).await;
-        Ok(())
-    }
-
-    async fn compose(&self, args: &[&str]) -> eyre::Result<()> {
-        let status = Command::new("docker")
-            .args(["compose", "-f"])
-            .arg(&self.compose)
-            .args(args)
-            .arg(&self.service)
-            .status()
-            .await
-            .wrap_err("docker compose")?;
-        eyre::ensure!(
-            status.success(),
-            "docker compose {} {} failed",
-            args.join(" "),
-            self.service
-        );
-        Ok(())
-    }
-}
-
+/// `proxy` is `None` when the origin is read directly, in which case origin counters come from the
+/// target's own metrics and faults cannot be injected.
 pub struct Runner {
     pub target: Arc<dyn Target>,
-    pub proxy: Arc<Proxy>,
+    pub proxy: Option<Arc<Proxy>>,
     pub dataset: Arc<Dataset>,
     pub verify: bool,
-    pub stack: Option<Stack>,
+    pub service: Option<Service>,
 }
 
 pub struct Outcome {
@@ -118,8 +76,8 @@ impl ConsumerStats {
 
 impl Runner {
     pub async fn run(&self, phases: Vec<Phase>) -> eyre::Result<Outcome> {
-        if let Some(stack) = &self.stack {
-            stack.recreate().await?;
+        if let Some(service) = &self.service {
+            service.recreate().await?;
         }
         let rss_max = Arc::new(AtomicU64::new(0));
         let sampler = {
@@ -159,14 +117,22 @@ impl Runner {
             "phase start"
         );
         if let Some(Action::RestartTarget) = phase.action {
-            if let Some(stack) = &self.stack {
-                stack.restart().await?;
+            if let Some(service) = &self.service {
+                service.restart().await?;
             } else {
                 tracing::warn!("target cannot be restarted, skipping the restart");
             }
         }
-        self.proxy.set_faults(phase.faults);
-        self.proxy.reset();
+        if let Some(proxy) = &self.proxy {
+            proxy.set_faults(phase.faults);
+            proxy.reset();
+        } else {
+            eyre::ensure!(
+                phase.faults == Faults::default(),
+                "phase {} injects faults, which needs the proxy in front of the origin",
+                phase.name
+            );
+        }
         let nestor_before = self.target.nestor().await;
 
         let started = Instant::now();
@@ -187,12 +153,15 @@ impl Runner {
         }
         let duration = started.elapsed();
 
-        let origin = self.proxy.snapshot();
+        let origin = self.proxy.as_ref().map(|proxy| {
+            let counters = proxy.snapshot();
+            proxy.set_faults(Faults::default());
+            counters
+        });
         let nestor = match (nestor_before, self.target.nestor().await) {
             (Some(before), Some(after)) => Some(after.delta(before)),
             _ => None,
         };
-        self.proxy.set_faults(Faults::default());
 
         let report = PhaseReport {
             name: phase.name.to_owned(),
@@ -214,7 +183,7 @@ impl Runner {
             reads = report.reads,
             errors = report.errors,
             corrupt = report.corrupt,
-            origin_requests = report.origin.requests,
+            origin_requests = report.origin_requests(),
             ttlb_p99_ms = report.ttlb.p99_ms,
             "phase done"
         );

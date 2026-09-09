@@ -39,11 +39,11 @@ pub fn origin_at(endpoint: &str, bucket: &str) -> Arc<AmazonS3> {
     )
 }
 
+/// Real S3 with the ambient credentials and `AWS_REGION`.
 pub fn aws(endpoint: &str, bucket: &str) -> Result<Arc<AmazonS3>, Error> {
     let transport = Transport::default();
     AmazonS3Builder::from_env()
         .with_bucket_name(bucket)
-        .with_region(REGION)
         .with_endpoint(endpoint.trim_end_matches('/'))
         .with_virtual_hosted_style_request(false)
         .with_client_options(transport.client_options())

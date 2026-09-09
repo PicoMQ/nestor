@@ -8,6 +8,9 @@
 **/proptest-regressions/
 
 nestor-bench/reports/
+harness/aws/reports/
+harness/aws/.terraform/
+harness/aws/*.tfstate*
 
 website/node_modules/
 website/.vitepress/cache/

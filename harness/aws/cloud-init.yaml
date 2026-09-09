@@ -1,0 +1,40 @@
+#cloud-config
+# Prepares the instance once: build tools, the pinned toolchain, the repository clone and the NVMe
+# mount. Building and running a ref is remote.sh, so one instance serves many runs.
+
+package_update: true
+packages:
+  - git
+  - gcc
+  - gcc-c++
+  - cmake
+  - make
+  - pkgconf-pkg-config
+  - perl
+
+write_files:
+  - path: /etc/nestor-bench/env
+    permissions: "0644"
+    content: |
+      REGION=${region}
+      BUCKET=${bucket}
+
+runcmd:
+  - |
+    set -euo pipefail
+    device=$(lsblk -dno NAME,MODEL | awk '/Instance Storage/ { print "/dev/" $1; exit }')
+    mkdir -p /mnt/nvme
+    if [ -n "$device" ]; then
+      mkfs.xfs -f "$device"
+      mount -o noatime "$device" /mnt/nvme
+    fi
+    useradd --system --shell /sbin/nologin nestor
+    install -d -o nestor -g nestor /mnt/nvme/nestor
+    install -d /mnt/nvme/bench /mnt/nvme/target /etc/nestor
+    export RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo
+    curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path --default-toolchain none
+    git clone ${repository} /opt/nestor
+    cd /opt/nestor
+    /usr/local/cargo/bin/rustup toolchain install
+    install -d /var/lib/nestor-bench
+    touch /var/lib/nestor-bench/ready

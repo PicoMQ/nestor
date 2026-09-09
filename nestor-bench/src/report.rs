@@ -38,7 +38,8 @@ pub struct PhaseReport {
     pub throughput_mib_s: f64,
     pub ttfb: Latency,
     pub ttlb: Latency,
-    pub origin: OriginCounters,
+    /// Counted by the proxy, `None` when the origin was read directly.
+    pub origin: Option<OriginCounters>,
     pub nestor: Option<NestorCounters>,
 }
 
@@ -49,8 +50,24 @@ impl PhaseReport {
         (total > 0).then(|| n.hits as f64 / total as f64)
     }
 
+    /// Requests the target made to the origin, from the proxy when there was one and otherwise
+    /// from nestor's own counters.
+    pub fn origin_requests(&self) -> u64 {
+        self.origin
+            .map(|o| o.requests)
+            .or(self.nestor.map(|n| n.origin_requests))
+            .unwrap_or(0)
+    }
+
+    pub fn origin_bytes(&self) -> u64 {
+        self.origin
+            .map(|o| o.bytes)
+            .or(self.nestor.map(|n| n.origin_bytes))
+            .unwrap_or(0)
+    }
+
     pub fn amplification(&self) -> Option<f64> {
-        (self.bytes > 0).then(|| self.origin.bytes as f64 / self.bytes as f64)
+        (self.bytes > 0).then(|| self.origin_bytes() as f64 / self.bytes as f64)
     }
 }
 
@@ -106,8 +123,8 @@ impl Report {
                 phase.ttfb.p50_ms,
                 phase.ttfb.p99_ms,
                 phase.ttlb.p99_ms,
-                phase.origin.requests,
-                phase.origin.bytes as f64 / (1024.0 * 1024.0),
+                phase.origin_requests(),
+                phase.origin_bytes() as f64 / (1024.0 * 1024.0),
             );
             if let Some(rate) = phase.hit_rate() {
                 let _ = write!(out, "  hit {:.1}%", rate * 100.0);
@@ -115,11 +132,13 @@ impl Report {
             if let Some(amp) = phase.amplification() {
                 let _ = write!(out, "  amp {amp:.2}x");
             }
-            if phase.origin.max_inflight > 1 {
-                let _ = write!(out, "  inflight {}", phase.origin.max_inflight);
-            }
-            if phase.origin.injected > 0 {
-                let _ = write!(out, "  injected {}", phase.origin.injected);
+            if let Some(origin) = phase.origin {
+                if origin.max_inflight > 1 {
+                    let _ = write!(out, "  inflight {}", origin.max_inflight);
+                }
+                if origin.injected > 0 {
+                    let _ = write!(out, "  injected {}", origin.injected);
+                }
             }
             if phase.errors > 0 {
                 let _ = write!(out, "  errors {}", phase.errors);
@@ -163,13 +182,13 @@ pub fn compare(a: &Report, b: &Report) -> String {
         row(format!("{n} ttlb p99 ms"), pa.ttlb.p99_ms, pb.ttlb.p99_ms);
         row(
             format!("{n} origin requests"),
-            pa.origin.requests as f64,
-            pb.origin.requests as f64,
+            pa.origin_requests() as f64,
+            pb.origin_requests() as f64,
         );
         row(
             format!("{n} origin MiB"),
-            pa.origin.bytes as f64 / (1024.0 * 1024.0),
-            pb.origin.bytes as f64 / (1024.0 * 1024.0),
+            pa.origin_bytes() as f64 / (1024.0 * 1024.0),
+            pb.origin_bytes() as f64 / (1024.0 * 1024.0),
         );
         if let (Some(x), Some(y)) = (pa.hit_rate(), pb.hit_rate()) {
             row(format!("{n} hit rate"), x, y);

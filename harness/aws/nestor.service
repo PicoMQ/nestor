@@ -1,0 +1,16 @@
+[Unit]
+Description=nestor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=nestor
+Group=nestor
+EnvironmentFile=/etc/nestor/env
+ExecStart=/usr/local/bin/nestor serve --config /etc/nestor/nestor.toml
+Restart=on-failure
+LimitNOFILE=1048576
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target
