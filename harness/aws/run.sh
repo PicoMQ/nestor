@@ -70,7 +70,7 @@ log "run $RUN on $(tf output -raw instance_type), follow with: aws ssm start-ses
 ssm 14400 "runs/$RUN/ssm" \
   "cd /opt/nestor && git fetch -q origin '$REF' && git checkout -q FETCH_HEAD" \
   "&& RUN='$RUN' TARGETS='${TARGETS:-library endpoint origin}' OBJECTS='${OBJECTS:-32}' PROFILE='${PROFILE:-stream-set}' SEED='${SEED:-1}'" \
-  "harness/aws/remote.sh ${SCENARIOS[*]}" || failed=1
+  "harness/aws/remote.sh ${SCENARIOS[*]:-}" || failed=1
 
 log "pulling reports"
 mkdir -p "$OUT/$RUN"

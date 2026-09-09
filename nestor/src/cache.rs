@@ -188,7 +188,7 @@ fn io_engine(io: DiskIo) -> foyer::Result<Box<dyn foyer::IoEngineConfig>> {
 
 #[cfg(target_os = "linux")]
 fn uring_engine(required: bool) -> foyer::Result<Box<dyn foyer::IoEngineConfig>> {
-    match io_uring::IoUring::builder().build(URING_DEPTH) {
+    match io_uring::IoUring::new(URING_DEPTH) {
         Ok(_) => Ok(Box::new(foyer::UringIoEngineConfig::new())),
         Err(e) if required => Err(foyer::Error::new(
             foyer::ErrorKind::Config,
