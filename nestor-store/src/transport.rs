@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use object_store::client::{HttpClient, HttpConnector, ReqwestConnector};
 use object_store::{ClientOptions, RetryConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,5 +44,23 @@ impl Transport {
             max_retries: 0,
             ..RetryConfig::default()
         }
+    }
+
+    /// Builds the HTTP client once. Construction loads the TLS root store, tens of milliseconds
+    /// on Linux, so stores that share a transport should share the client too.
+    pub fn shared_client(&self) -> Result<SharedClient, object_store::Error> {
+        ReqwestConnector::default()
+            .connect(&self.client_options())
+            .map(SharedClient)
+    }
+}
+
+/// An [`HttpConnector`] that hands every store the same already built client.
+#[derive(Debug, Clone)]
+pub struct SharedClient(HttpClient);
+
+impl HttpConnector for SharedClient {
+    fn connect(&self, _: &ClientOptions) -> Result<HttpClient, object_store::Error> {
+        Ok(self.0.clone())
     }
 }

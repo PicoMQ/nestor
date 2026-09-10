@@ -40,7 +40,7 @@ Disk `region_size` trades reclaim granularity for write size. `64` MiB is fine f
 
 `origin_concurrency` bounds concurrent origin `GET`s per process. `64` is conservative for S3 and generous for a single self-hosted MinIO. The cost of setting it too high is a surge on cold start when every read is a miss, the cost of setting it too low is misses queueing behind each other. Watch `nestor_origin_ttfb_seconds` while raising it, an origin under pressure shows up there before it shows up as errors.
 
-Hedging adds at most `hedge_concurrency` extra requests at any moment and normally far fewer. With the default `factor = 3.0` a hedge fires only for requests three times slower than the running average. Lower the factor toward `2.0` on origins with a fat tail, raise it or disable hedging on origins that charge per request and have none.
+Hedging adds at most `hedge_concurrency` extra requests at any moment and normally far fewer. With the default `factor = 3.0` a hedge fires only for headers or a block three times slower than the recent mean. Lower the factor toward `2.0` on origins with a fat tail, raise it or disable hedging on origins that charge per request and have none. `quantile = 0.99` fixes the hedge rate at about one in a hundred regardless of the shape of the distribution, which is the better choice when the mean is dominated by a few very slow responses. `min` floors both stages, so on a fast origin it decides how long a block may stall before a second request goes out. The default `50` ms is several times the per-block time of S3 at `1` MiB blocks; raise it if `nestor_hedges_total{phase="body"}` grows without wins.
 
 ## Fetch timeouts
 

@@ -2,16 +2,16 @@
 
 use std::collections::VecDeque;
 use std::ops::Range;
+use std::pin::pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use bytes::{Bytes, BytesMut};
-use futures::StreamExt;
+use bytes::Bytes;
 use futures::future::join_all;
 use tokio::sync::Semaphore;
 
 use crate::block::group_misses;
+use crate::body::HedgedBody;
 use crate::cache::BlockCache;
 use crate::error::{NestorError, OriginError};
 use crate::inflight::{Inflight, Registration, Slot, SlotHandle};
@@ -20,43 +20,6 @@ use crate::meta::MetaCache;
 use crate::namespace::NamespaceState;
 use crate::origin::{GetOptions, GetResponse, ObjectMeta};
 use crate::policy::{FetchPolicy, Retry};
-
-const ALPHA_SHIFT: u32 = 3;
-
-#[derive(Debug, Default)]
-pub struct Latency {
-    ewma_nanos: AtomicU64,
-}
-
-impl Latency {
-    pub fn observe(&self, sample: Duration) {
-        let sample = sample.as_nanos().min(u128::from(u64::MAX)) as u64;
-        let mut current = self.ewma_nanos.load(Ordering::Relaxed);
-        loop {
-            let next = if current == 0 {
-                sample
-            } else {
-                current - (current >> ALPHA_SHIFT) + (sample >> ALPHA_SHIFT)
-            };
-            match self.ewma_nanos.compare_exchange_weak(
-                current,
-                next.max(1),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return,
-                Err(actual) => current = actual,
-            }
-        }
-    }
-
-    pub fn get(&self) -> Option<Duration> {
-        match self.ewma_nanos.load(Ordering::Relaxed) {
-            0 => None,
-            nanos => Some(Duration::from_nanos(nanos)),
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Priority {
@@ -163,7 +126,6 @@ impl Fetcher {
                 }
                 Ok(None) | Err(_) => match self.inflight.register(key) {
                     Registration::Owner(slot, handle) => {
-                        metrics.misses.increment(1);
                         owners.push(slot);
                         handles.push(handle);
                     }
@@ -175,6 +137,24 @@ impl Fetcher {
             }
         }
 
+        if owners.is_empty() {
+            return handles;
+        }
+        let landed = join_all(owners.iter().map(|slot| self.cache.get(slot.key()))).await;
+        let owners: Vec<Slot> = owners
+            .into_iter()
+            .zip(landed)
+            .filter_map(|(slot, found)| {
+                if let Ok(Some(entry)) = found {
+                    metrics.hits.increment(1);
+                    slot.resolve(Ok(entry.value().clone()));
+                    None
+                } else {
+                    metrics.misses.increment(1);
+                    Some(slot)
+                }
+            })
+            .collect();
         if owners.is_empty() {
             return handles;
         }
@@ -432,7 +412,7 @@ impl Fetcher {
                 got: 0,
             });
         }
-        self.consume(ctx, response, slots).await
+        self.consume(ctx, response, slots, range.end).await
     }
 
     async fn retry_or_fail(
@@ -463,18 +443,12 @@ impl Fetcher {
         metrics.origin_requests.increment(1);
         let started = Instant::now();
         let headers_by = (started + ctx.policy.first_byte).min(attempt_deadline);
-        let result = tokio::time::timeout_at(headers_by.into(), self.get_hedged(ctx, options))
+        tokio::time::timeout_at(headers_by.into(), self.get_hedged(ctx, options))
             .await
             .unwrap_or_else(|_| {
                 metrics.origin_timeouts.increment(1);
                 Err(OriginError::Timeout(headers_by - started))
-            });
-        if result.is_ok() {
-            let ttfb = started.elapsed();
-            ctx.namespace.latency.observe(ttfb);
-            metrics.origin_ttfb.record(ttfb.as_secs_f64());
-        }
-        result
+            })
     }
 
     async fn get_hedged(
@@ -482,26 +456,38 @@ impl Fetcher {
         ctx: &ReadCtx,
         options: GetOptions,
     ) -> Result<GetResponse, OriginError> {
-        let origin = &ctx.namespace.origin;
-        let mut primary = origin.get(&ctx.name, options.clone());
+        let ns = &ctx.namespace;
+        let started = Instant::now();
+        let mut primary = pin!(ns.origin.get(&ctx.name, options.clone()));
         let Some(hedge) = &ctx.policy.hedge else {
-            return primary.await;
+            return observe_ttfb(ns, started, primary.await);
         };
-        let delay = hedge.delay(ctx.namespace.latency.get());
+        let delay = hedge.delay(&ns.ttfb);
+        ns.metrics.hedge_headers.delay.set(delay.as_secs_f64());
         tokio::select! {
-            result = &mut primary => result,
+            result = &mut primary => observe_ttfb(ns, started, result),
             () = tokio::time::sleep(delay) => {
                 let Ok(_permit) = self.hedges.try_acquire() else {
-                    return primary.await;
+                    return observe_ttfb(ns, started, primary.await);
                 };
-                ctx.namespace.metrics.hedges.increment(1);
-                let secondary = origin.get(&ctx.name, options);
+                ns.metrics.hedge_headers.issued.increment(1);
+                let hedged_at = Instant::now();
+                let mut secondary = pin!(ns.origin.get(&ctx.name, options));
                 tokio::select! {
-                    result = &mut primary => result,
-                    result = secondary => {
-                        ctx.namespace.metrics.hedge_wins.increment(1);
-                        result
-                    }
+                    result = &mut primary => match result {
+                        Err(e) if e.is_retryable() => {
+                            ns.metrics.hedge_headers.wins.increment(1);
+                            observe_ttfb(ns, hedged_at, secondary.await)
+                        }
+                        result => observe_ttfb(ns, started, result),
+                    },
+                    result = &mut secondary => match result {
+                        Err(e) if e.is_retryable() => observe_ttfb(ns, started, primary.await),
+                        result => {
+                            ns.metrics.hedge_headers.wins.increment(1);
+                            observe_ttfb(ns, hedged_at, result)
+                        }
+                    },
                 }
             }
         }
@@ -512,75 +498,51 @@ impl Fetcher {
         ctx: &ReadCtx,
         response: GetResponse,
         slots: &mut VecDeque<Slot>,
+        range_end: u64,
     ) -> Result<(), OriginError> {
-        let bs = ctx.namespace.config.block_size;
-        let metrics = &ctx.namespace.metrics;
+        let ns = &ctx.namespace;
+        let bs = ns.config.block_size;
         let meta = response.meta;
         let size = Some(meta.size);
-        let mut body = response.body;
-        let mut buf = BytesMut::new();
+        let mut body = HedgedBody::new(ctx, &self.hedges, response.body, range_end);
 
         while let Some(front) = slots.front() {
-            let expected = bs.block_range(front.key().index, size).count();
+            let index = front.key().index;
+            let expected = bs.block_range(index, size).count();
             if expected == 0 {
                 let slot = slots.pop_front().expect("front exists");
                 slot.resolve(Ok(Block::empty(meta.clone())));
                 continue;
             }
-            let Some(chunk) = body.next().await else {
-                return Err(OriginError::ShortRead {
-                    expected: expected as u64,
-                    got: buf.len() as u64,
-                });
-            };
-            let mut chunk = chunk?;
-            while !chunk.is_empty() {
-                let Some(front) = slots.front() else {
-                    return Ok(());
-                };
-                let expected = bs.block_range(front.key().index, size).count();
-                let need = expected - buf.len();
-                let block = if buf.is_empty() && chunk.len() >= need {
-                    chunk.split_to(need)
-                } else {
-                    let take = need.min(chunk.len());
-                    if buf.capacity() < expected {
-                        buf.reserve(expected - buf.capacity());
-                    }
-                    buf.extend_from_slice(&chunk.split_to(take));
-                    if buf.len() < expected {
-                        continue;
-                    }
-                    buf.split().freeze()
-                };
-                let slot = slots.pop_front().expect("front exists");
-                metrics.origin_bytes.increment(block.len() as u64);
-                let block = Block::new(meta.clone(), block);
-                self.cache.insert(slot.key().clone(), block.clone());
-                slot.resolve(Ok(block));
-            }
+            let block = body.next_block(index, expected).await?;
+            let lap = body.lap();
+            ns.block.observe(lap);
+            ns.metrics.origin_block.record(lap.as_secs_f64());
+            let slot = slots.pop_front().expect("front exists");
+            ns.metrics.origin_bytes.increment(block.len() as u64);
+            let block = Block::new(meta.clone(), block);
+            self.cache.insert(slot.key().clone(), block.clone());
+            slot.resolve(Ok(block));
         }
         Ok(())
     }
 }
 
+fn observe_ttfb(
+    ns: &NamespaceState,
+    started: Instant,
+    result: Result<GetResponse, OriginError>,
+) -> Result<GetResponse, OriginError> {
+    if result.is_ok() {
+        let ttfb = started.elapsed();
+        ns.ttfb.observe(ttfb);
+        ns.metrics.origin_ttfb.record(ttfb.as_secs_f64());
+    }
+    result
+}
+
 fn resolve_all(slots: VecDeque<Slot>, result: &Result<Block, Arc<NestorError>>) {
     for slot in slots {
         slot.resolve(result.clone());
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ewma_converges() {
-        let l = Latency::default();
-        for _ in 0..64 {
-            l.observe(Duration::from_millis(40));
-        }
-        let v = l.get().unwrap();
-        assert!(v >= Duration::from_millis(39) && v <= Duration::from_millis(41));
     }
 }

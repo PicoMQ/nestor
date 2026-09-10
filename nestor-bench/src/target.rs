@@ -19,7 +19,8 @@ use nestor_store::{NestorStore, ObjectStoreOrigin};
 use object_store::path::Path;
 use object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutPayload};
 use serde::{Deserialize, Serialize};
-use tokio::process::Command;
+
+use crate::service::{Service, clear_dir};
 
 pub struct Read {
     pub first_byte: Duration,
@@ -116,6 +117,7 @@ impl Library {
         let mut cache = CacheConfig::memory(config.memory);
         if let Some(path) = &config.disk_path {
             std::fs::create_dir_all(path)?;
+            clear_dir(path).await?;
             cache = cache.disk(DiskConfig::new(path, config.disk_capacity));
         }
         let consistency = if config.immutable {
@@ -197,7 +199,7 @@ pub struct Endpoint {
     name: String,
     store: Arc<dyn ObjectStore>,
     metrics_url: Option<String>,
-    container: Option<String>,
+    service: Option<Service>,
 }
 
 impl Endpoint {
@@ -205,13 +207,13 @@ impl Endpoint {
         name: impl Into<String>,
         store: Arc<dyn ObjectStore>,
         metrics_url: Option<String>,
-        container: Option<String>,
+        service: Option<Service>,
     ) -> Self {
         Self {
             name: name.into(),
             store,
             metrics_url,
-            container,
+            service,
         }
     }
 }
@@ -267,22 +269,6 @@ impl Target for Endpoint {
     }
 
     async fn rss_bytes(&self) -> Option<u64> {
-        let container = self.container.as_ref()?;
-        let output = Command::new("docker")
-            .args([
-                "stats",
-                "--no-stream",
-                "--format",
-                "{{.MemUsage}}",
-                container,
-            ])
-            .output()
-            .await
-            .ok()?;
-        let text = String::from_utf8_lossy(&output.stdout);
-        let used = text.split('/').next()?.trim();
-        byte_unit::Byte::parse_str(used, true)
-            .ok()
-            .map(|b| b.as_u64())
+        self.service.as_ref()?.rss_bytes().await
     }
 }

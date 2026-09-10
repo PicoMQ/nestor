@@ -39,6 +39,8 @@ hedge_concurrency = 16
 # direct_io = true
 # compression = "none"        # none, lz4, zstd
 # recover = "quiet"           # none, quiet, strict
+# io = "auto"                 # auto, uring, or psync
+# runtime_threads = 4         # foyer runtime workers, default flushers + reclaimers
 
 [buckets]
 block_size = "1 MiB"          # power of two, 64 KiB to 16 MiB
@@ -55,7 +57,7 @@ backoff_max = "2s"
 first_byte = "5s"             # headers must arrive within this per attempt
 attempt = "30s"               # one attempt including its body
 deadline = "60s"              # the fetch as a whole, across attempts
-hedge = { factor = 3.0, min = "50ms", max = "2s" }   # or false to disable
+hedge = { factor = 3.0, min = "50ms", max = "2s" }   # factor of the mean, or quantile = 0.99, or false
 
 # Serve reads from a cluster of nestor nodes instead of the origin. This binary becomes the local
 # tier, writes still go to [origin]. Use either nodes or dns.

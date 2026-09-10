@@ -60,7 +60,7 @@ The disk is written as a log of regions. A block is appended to the current regi
 
 Inserts are written to disk at insertion time rather than on eviction from RAM. With this policy a block is durable on disk as soon as the origin has delivered it, so a restart shortly after warming does not lose the warm set, and RAM eviction never causes a burst of disk writes. Writes are buffered in a pool shared by the flushers, sized from capacity and clamped to `[flushers * region_size, 256 MiB]`.
 
-Disk I/O uses `io_uring` on Linux and falls back to `psync` where it is unavailable, such as under Docker's default seccomp profile.
+Disk I/O uses `io_uring` on Linux when `cache.disk.io` is `auto` or `uring`, and `psync` otherwise. `auto` probes a ring of depth 64, matching foyer, and falls back where the syscall is blocked, such as Docker's default seccomp profile. Disk work runs on a dedicated Tokio runtime so `pread`/`pwrite` in the psync engine do not share the S3 worker pool.
 
 ## Restart
 

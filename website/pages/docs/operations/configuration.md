@@ -71,6 +71,8 @@ Absent by default. Present enables the disk tier.
 | `direct_io` | `true` | `O_DIRECT` on Linux. Ignored elsewhere. |
 | `compression` | `none` | `lz4` or `zstd`. |
 | `recover` | `quiet` | `none`, `quiet` or `strict`. |
+| `io` | `auto` | `auto` probes io_uring (depth 64) and falls back to `psync`. `uring` fails start if the ring cannot be created. `psync` skips the probe. `uring` requires Linux. |
+| `runtime_threads` | `flushers + reclaimers` | Workers of the Tokio runtime foyer's disk tasks run on. |
 
 ## `[buckets]`
 
@@ -97,7 +99,7 @@ How a miss goes to the origin, see [Fetch policy](/docs/design/fetches#fetch-pol
 | `first_byte` | `5s` | Time for one attempt to return headers. |
 | `attempt` | `30s` | Time for one attempt including its body. |
 | `deadline` | `60s` | Time for the fetch as a whole. |
-| `hedge` | `{ factor = 3.0, min = "50ms", max = "2s" }` | Tail hedging against the origin. `false` disables. |
+| `hedge` | `{ factor = 3.0, min = "50ms", max = "2s" }` | Tail hedging of headers and of each block, see [Hedging](/docs/design/fetches#hedging). `factor` times the mean or `quantile` of the window, one of the two. `false` disables. |
 
 ## `[cluster]`
 
@@ -112,7 +114,7 @@ Absent by default. Present turns this binary into a gateway that reads from a cl
 | `read_window` | `16` | Cluster blocks in flight per read. |
 | `load_limit` | `256` | In-flight requests per node before spilling to the next choice. |
 | `down_for` | `5s` | How long a node is skipped after a connection failure. |
-| `hedge` | `{ factor = 3.0, min = "50ms", max = "2s" }` | Hedging across nodes. |
+| `hedge` | `{ factor = 3.0, min = "50ms", max = "2s" }` | Hedging across nodes, same form as `buckets.fetch.hedge`. |
 | `connect_timeout` | `5s` | TCP and TLS setup toward a node. |
 | `tls` | `false` | Use `https` toward nodes. |
 | `credentials` | unset | `{ access_key, secret_key }` matching the nodes' `[auth]`. |

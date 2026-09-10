@@ -8,6 +8,7 @@
 **/proptest-regressions/
 
 nestor-bench/reports/
+harness/
 
 website/node_modules/
 website/.vitepress/cache/

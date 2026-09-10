@@ -3,11 +3,12 @@
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::ops::Range;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use axum::serve::ListenerExt;
 use bytes::Bytes;
 use futures::TryStreamExt;
 use http::Uri;
@@ -34,15 +35,17 @@ struct NodeOrigin {
     requests: Arc<AtomicUsize>,
     ranges: Arc<Mutex<Vec<Range<u64>>>>,
     delay: Duration,
+    fail_next: Arc<AtomicBool>,
 }
 
 impl NodeOrigin {
-    fn new(store: &Arc<InMemory>, delay: Duration) -> Self {
+    fn new(store: &Arc<InMemory>, delay: Duration, fail_next: &Arc<AtomicBool>) -> Self {
         Self {
             inner: Arc::new(ObjectStoreOrigin::new(Arc::clone(store) as _)),
             requests: Arc::new(AtomicUsize::new(0)),
             ranges: Arc::new(Mutex::new(Vec::new())),
             delay,
+            fail_next: Arc::clone(fail_next),
         }
     }
 
@@ -60,8 +63,12 @@ impl NodeOrigin {
 #[async_trait]
 impl Origin for NodeOrigin {
     async fn get(&self, object: &str, options: GetOptions) -> Result<GetResponse, OriginError> {
+        let failing = self.fail_next.swap(false, Ordering::Relaxed);
         tokio::time::sleep(self.delay).await;
         self.requests.fetch_add(1, Ordering::Relaxed);
+        if failing {
+            return Err(OriginError::io(std::io::Error::other("injected failure")));
+        }
         if let Some(range) = &options.range {
             self.ranges.lock().unwrap().push(range.clone());
         }
@@ -85,15 +92,17 @@ struct Nodes {
     store: Arc<InMemory>,
     addrs: Vec<SocketAddr>,
     origins: Vec<NodeOrigin>,
+    fail_next: Arc<AtomicBool>,
 }
 
 impl Nodes {
     async fn start(delays: &[Duration]) -> Self {
         let store = Arc::new(InMemory::new());
+        let fail_next = Arc::new(AtomicBool::new(false));
         let mut addrs = Vec::new();
         let mut origins = Vec::new();
         for delay in delays {
-            let origin = NodeOrigin::new(&store, *delay);
+            let origin = NodeOrigin::new(&store, *delay, &fail_next);
             let nestor = Nestor::builder(CacheConfig::memory(64 << 20))
                 .build()
                 .await
@@ -105,13 +114,16 @@ impl Nodes {
                 addressing: Addressing::Path,
                 buckets: NamespaceConfig::default()
                     .block_size(BlockSize::new(BLOCK).unwrap())
-                    .fetch(FetchPolicy::default().hedge(None))
+                    .fetch(FetchPolicy::default().hedge(None).attempts(1))
                     .readahead(0),
                 populate_max: None,
             };
             let router = S3Service::new(nestor, config).router();
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             addrs.push(listener.local_addr().unwrap());
+            let listener = listener.tap_io(|stream| {
+                stream.set_nodelay(true).unwrap();
+            });
             tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
             origins.push(origin);
         }
@@ -119,7 +131,12 @@ impl Nodes {
             store,
             addrs,
             origins,
+            fail_next,
         }
+    }
+
+    fn fail_next_origin_request(&self) {
+        self.fail_next.store(true, Ordering::Relaxed);
     }
 
     async fn put(&self, key: &str, len: usize) -> Bytes {
@@ -283,11 +300,10 @@ async fn hedge_beats_a_slow_node() {
     nodes.put("hedged", 8 * BLOCK_USIZE).await;
     let origin = nodes
         .cluster(ClusterConfig {
-            hedge: Some(HedgeConfig {
-                factor: 2.0,
-                min: Duration::from_millis(30),
-                max: Duration::from_millis(60),
-            }),
+            hedge: Some(
+                HedgeConfig::factor(2.0, Duration::from_millis(30), Duration::from_millis(60))
+                    .unwrap(),
+            ),
             ..config()
         })
         .await;
@@ -299,6 +315,32 @@ async fn hedge_beats_a_slow_node() {
         "{:?}",
         started.elapsed()
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hedge_takes_over_when_the_primary_node_fails() {
+    let nodes = Nodes::start(&[Duration::from_millis(200); 2]).await;
+    let body = nodes.put("handover", BLOCK_USIZE).await;
+    let origin = nodes
+        .cluster(ClusterConfig {
+            hedge: Some(
+                HedgeConfig::factor(1.0, Duration::from_millis(50), Duration::from_millis(50))
+                    .unwrap(),
+            ),
+            ..config()
+        })
+        .await;
+
+    nodes.fail_next_origin_request();
+    let started = Instant::now();
+    let (_, bytes) = read(&origin, "handover", None).await;
+    assert_eq!(bytes, body);
+    assert!(
+        started.elapsed() < Duration::from_millis(350),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(nodes.origin_requests(), 2);
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -3,25 +3,37 @@
 use std::time::{Duration, Instant};
 
 use crate::error::OriginError;
+use crate::latency::Latency;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[cfg_attr(
-    feature = "serde",
-    derive(serde::Serialize, serde::Deserialize),
-    serde(deny_unknown_fields, default)
-)]
+pub enum HedgeAfter {
+    Factor(f64),
+    Quantile(f64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HedgeConfig {
-    pub factor: f64,
-    #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
+    pub after: HedgeAfter,
     pub min: Duration,
-    #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
     pub max: Duration,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum HedgeConfigError {
+    #[error("hedge.factor must be greater than 0, got {0}")]
+    Factor(f64),
+    #[error("hedge.quantile must be in (0, 1], got {0}")]
+    Quantile(f64),
+    #[error("hedge.min {min:?} exceeds hedge.max {max:?}")]
+    Bounds { min: Duration, max: Duration },
+    #[error("hedge.factor and hedge.quantile cannot both be set")]
+    Exclusive,
 }
 
 impl Default for HedgeConfig {
     fn default() -> Self {
         Self {
-            factor: 3.0,
+            after: HedgeAfter::Factor(3.0),
             min: Duration::from_millis(50),
             max: Duration::from_secs(2),
         }
@@ -29,11 +41,96 @@ impl Default for HedgeConfig {
 }
 
 impl HedgeConfig {
-    pub fn delay(&self, observed: Option<Duration>) -> Duration {
-        match observed {
-            None => self.max,
-            Some(ttfb) => ttfb.mul_f64(self.factor).clamp(self.min, self.max),
+    pub fn factor(factor: f64, min: Duration, max: Duration) -> Result<Self, HedgeConfigError> {
+        if factor.is_nan() || factor <= 0.0 {
+            return Err(HedgeConfigError::Factor(factor));
         }
+        Self::new(HedgeAfter::Factor(factor), min, max)
+    }
+
+    pub fn quantile(quantile: f64, min: Duration, max: Duration) -> Result<Self, HedgeConfigError> {
+        if quantile.is_nan() || quantile <= 0.0 || quantile > 1.0 {
+            return Err(HedgeConfigError::Quantile(quantile));
+        }
+        Self::new(HedgeAfter::Quantile(quantile), min, max)
+    }
+
+    fn new(after: HedgeAfter, min: Duration, max: Duration) -> Result<Self, HedgeConfigError> {
+        if min > max {
+            return Err(HedgeConfigError::Bounds { min, max });
+        }
+        Ok(Self { after, min, max })
+    }
+
+    pub fn delay(&self, latency: &Latency) -> Duration {
+        let estimate = match self.after {
+            HedgeAfter::Factor(factor) => latency.mean().map(|mean| mean.mul_f64(factor)),
+            HedgeAfter::Quantile(quantile) => latency.quantile(quantile),
+        };
+        estimate.map_or(self.max, |delay| delay.clamp(self.min, self.max))
+    }
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawHedge {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    factor: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quantile: Option<f64>,
+    #[serde(default, with = "humantime_serde::option")]
+    min: Option<Duration>,
+    #[serde(default, with = "humantime_serde::option")]
+    max: Option<Duration>,
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<RawHedge> for HedgeConfig {
+    type Error = HedgeConfigError;
+
+    fn try_from(raw: RawHedge) -> Result<Self, HedgeConfigError> {
+        let defaults = Self::default();
+        let min = raw.min.unwrap_or(defaults.min);
+        let max = raw.max.unwrap_or(defaults.max);
+        match (raw.factor, raw.quantile) {
+            (Some(_), Some(_)) => Err(HedgeConfigError::Exclusive),
+            (None, Some(quantile)) => Self::quantile(quantile, min, max),
+            (Some(factor), None) => Self::factor(factor, min, max),
+            (None, None) => Self::new(defaults.after, min, max),
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl From<HedgeConfig> for RawHedge {
+    fn from(config: HedgeConfig) -> Self {
+        let (factor, quantile) = match config.after {
+            HedgeAfter::Factor(factor) => (Some(factor), None),
+            HedgeAfter::Quantile(quantile) => (None, Some(quantile)),
+        };
+        Self {
+            factor,
+            quantile,
+            min: Some(config.min),
+            max: Some(config.max),
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for HedgeConfig {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        RawHedge::from(*self).serialize(serializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for HedgeConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        RawHedge::deserialize(deserializer)?
+            .try_into()
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -290,15 +387,58 @@ mod tests {
     }
 
     #[test]
-    fn delay_is_clamped() {
+    fn delay_is_clamped_and_falls_back_to_max() {
         let cfg = HedgeConfig::default();
-        assert_eq!(cfg.delay(None), cfg.max);
-        assert_eq!(cfg.delay(Some(Duration::from_millis(1))), cfg.min);
-        assert_eq!(cfg.delay(Some(Duration::from_secs(10))), cfg.max);
-        assert_eq!(
-            cfg.delay(Some(Duration::from_millis(100))),
-            Duration::from_millis(300)
+        let latency = Latency::default();
+        assert_eq!(cfg.delay(&latency), cfg.max);
+        latency.observe(Duration::from_millis(1));
+        assert_eq!(cfg.delay(&latency), cfg.min);
+        let slow = Latency::default();
+        slow.observe(Duration::from_secs(10));
+        assert_eq!(cfg.delay(&slow), cfg.max);
+        let mid = Latency::default();
+        mid.observe(Duration::from_millis(100));
+        assert_eq!(cfg.delay(&mid), Duration::from_millis(300));
+    }
+
+    #[test]
+    fn quantile_delay_follows_the_tail() {
+        let cfg =
+            HedgeConfig::quantile(0.99, Duration::from_millis(1), Duration::from_secs(2)).unwrap();
+        let latency = Latency::default();
+        assert_eq!(cfg.delay(&latency), cfg.max);
+        for _ in 0..98 {
+            latency.observe(Duration::from_millis(10));
+        }
+        latency.observe(Duration::from_millis(500));
+        latency.observe(Duration::from_millis(500));
+        let delay = cfg.delay(&latency);
+        assert!(
+            delay >= Duration::from_millis(500) && delay <= Duration::from_millis(570),
+            "{delay:?}"
         );
+    }
+
+    #[test]
+    fn constructors_validate() {
+        let (min, max) = (Duration::from_millis(50), Duration::from_secs(2));
+        assert_eq!(
+            HedgeConfig::factor(0.0, min, max),
+            Err(HedgeConfigError::Factor(0.0))
+        );
+        assert_eq!(
+            HedgeConfig::quantile(0.0, min, max),
+            Err(HedgeConfigError::Quantile(0.0))
+        );
+        assert_eq!(
+            HedgeConfig::quantile(1.5, min, max),
+            Err(HedgeConfigError::Quantile(1.5))
+        );
+        assert_eq!(
+            HedgeConfig::factor(2.0, max, min),
+            Err(HedgeConfigError::Bounds { min: max, max: min })
+        );
+        assert!(HedgeConfig::quantile(1.0, min, max).is_ok());
     }
 
     #[test]
@@ -318,9 +458,30 @@ mod tests {
         let on: FetchPolicy = toml::from_str("hedge = true").unwrap();
         assert_eq!(on.hedge, Some(HedgeConfig::default()));
         let custom: FetchPolicy = toml::from_str("hedge = { factor = 2.0 }").unwrap();
-        assert!((custom.hedge.unwrap().factor - 2.0).abs() < f64::EPSILON);
+        assert_eq!(custom.hedge.unwrap().after, HedgeAfter::Factor(2.0));
+        let quantile: FetchPolicy =
+            toml::from_str(r#"hedge = { quantile = 0.99, min = "10ms" }"#).unwrap();
+        assert_eq!(
+            quantile.hedge,
+            Some(
+                HedgeConfig::quantile(0.99, Duration::from_millis(10), Duration::from_secs(2))
+                    .unwrap()
+            )
+        );
         let omitted: FetchPolicy = toml::from_str("attempts = 4").unwrap();
         assert_eq!(omitted.hedge, Some(HedgeConfig::default()));
         assert_eq!(omitted.attempts, 4);
+        for bad in [
+            "hedge = { factor = 2.0, quantile = 0.99 }",
+            "hedge = { quantile = 0 }",
+            "hedge = { factor = 0 }",
+            r#"hedge = { min = "3s", max = "2s" }"#,
+            "hedge = { window = 1 }",
+        ] {
+            assert!(toml::from_str::<FetchPolicy>(bad).is_err(), "{bad}");
+        }
+        let serialized = toml::to_string(&quantile).unwrap();
+        let roundtrip: FetchPolicy = toml::from_str(&serialized).unwrap();
+        assert_eq!(roundtrip, quantile);
     }
 }

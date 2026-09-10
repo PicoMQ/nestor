@@ -272,11 +272,9 @@ async fn hedge_fires_on_slow_primary() {
     let data = pattern(BLOCK as usize);
     origin.put("obj", data.clone());
     let mut ns = namespace(origin.clone(), Consistency::Immutable);
-    ns.config.fetch.hedge = Some(HedgeConfig {
-        factor: 1.0,
-        min: Duration::from_millis(10),
-        max: Duration::from_millis(10),
-    });
+    ns.config.fetch.hedge = Some(
+        HedgeConfig::factor(1.0, Duration::from_millis(10), Duration::from_millis(10)).unwrap(),
+    );
     let (nestor, id) = engine(ns).await;
 
     origin.slow_next(1, Duration::from_millis(500));
@@ -285,6 +283,101 @@ async fn hedge_fires_on_slow_primary() {
     assert_eq!(out, data.slice(0..100));
     assert!(started.elapsed() < Duration::from_millis(400));
     assert_eq!(origin.gets(), 2);
+}
+
+#[tokio::test]
+async fn quantile_hedge_fires_after_a_fast_history() {
+    let origin = Arc::new(MemoryOrigin::new());
+    let data = pattern(BLOCK as usize);
+    for i in 0..6 {
+        origin.put(format!("obj{i}"), data.clone());
+    }
+    let mut ns = namespace(origin.clone(), Consistency::Immutable);
+    ns.config.fetch.hedge = Some(
+        HedgeConfig::quantile(0.99, Duration::from_millis(5), Duration::from_secs(1)).unwrap(),
+    );
+    let (nestor, id) = engine(ns).await;
+
+    for i in 0..5 {
+        nestor.read(id, &format!("obj{i}"), 0..100).await.unwrap();
+    }
+    assert_eq!(origin.gets(), 5);
+
+    origin.slow_next(1, Duration::from_millis(500));
+    let started = std::time::Instant::now();
+    let out = nestor.read(id, "obj5", 0..100).await.unwrap();
+    assert_eq!(out, data.slice(0..100));
+    assert!(started.elapsed() < Duration::from_millis(400));
+    assert_eq!(origin.gets(), 7);
+}
+
+#[tokio::test]
+async fn hedge_takes_over_when_the_primary_fails() {
+    let origin = Arc::new(MemoryOrigin::new());
+    let data = pattern(BLOCK as usize);
+    origin.put("obj", data.clone());
+    let mut ns = namespace(origin.clone(), Consistency::Immutable);
+    ns.config.fetch.hedge = Some(
+        HedgeConfig::factor(1.0, Duration::from_millis(20), Duration::from_millis(20)).unwrap(),
+    );
+    let (nestor, id) = engine(ns).await;
+
+    origin.set_latency(Duration::from_millis(300));
+    origin.fail_next(1);
+    let started = std::time::Instant::now();
+    let out = nestor.read(id, "obj", 0..100).await.unwrap();
+    assert_eq!(out, data.slice(0..100));
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(origin.gets(), 2);
+}
+
+#[tokio::test]
+async fn body_hedge_fetches_only_the_remaining_range() {
+    let origin = Arc::new(MemoryOrigin::new().with_chunk(BLOCK as usize));
+    let data = pattern(4 * BLOCK as usize);
+    origin.put("obj", data.clone());
+    let mut ns = namespace(origin.clone(), Consistency::Immutable);
+    ns.config.fetch.hedge = Some(
+        HedgeConfig::factor(1.0, Duration::from_millis(20), Duration::from_millis(20)).unwrap(),
+    );
+    let (nestor, id) = engine(ns).await;
+
+    origin.stall_next(1, Duration::from_millis(500));
+    let started = std::time::Instant::now();
+    let out = nestor.read(id, "obj", 0..data.len() as u64).await.unwrap();
+    assert_eq!(out, data);
+    assert!(
+        started.elapsed() < Duration::from_millis(400),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(origin.gets(), 2);
+    assert_eq!(
+        origin
+            .stats()
+            .bytes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        4 * BLOCK + 3 * BLOCK
+    );
+}
+
+#[tokio::test]
+async fn disabled_hedge_waits_out_a_stalled_body() {
+    let origin = Arc::new(MemoryOrigin::new().with_chunk(BLOCK as usize));
+    let data = pattern(2 * BLOCK as usize);
+    origin.put("obj", data.clone());
+    let (nestor, id) = engine(namespace(origin.clone(), Consistency::Immutable)).await;
+
+    origin.stall_next(1, Duration::from_millis(100));
+    let started = std::time::Instant::now();
+    let out = nestor.read(id, "obj", 0..data.len() as u64).await.unwrap();
+    assert_eq!(out, data);
+    assert!(started.elapsed() >= Duration::from_millis(100));
+    assert_eq!(origin.gets(), 1);
 }
 
 fn is_timeout(err: &NestorError) -> bool {
@@ -563,11 +656,9 @@ async fn faulty_origin_never_truncates_a_read() {
         origin.put(format!("obj{i}"), data.clone());
     }
     let mut ns = namespace(origin.clone(), Consistency::Immutable);
-    ns.config.fetch = ns.config.fetch.attempts(6).hedge(Some(HedgeConfig {
-        factor: 1.0,
-        min: Duration::from_millis(1),
-        max: Duration::from_millis(2),
-    }));
+    ns.config.fetch = ns.config.fetch.attempts(6).hedge(Some(
+        HedgeConfig::factor(1.0, Duration::from_millis(1), Duration::from_millis(2)).unwrap(),
+    ));
     ns.config.fetch_window = 2;
     let (nestor, id) = engine(ns).await;
     origin.set_latency(Duration::from_millis(3));

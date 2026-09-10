@@ -11,7 +11,7 @@ use figment::Figment;
 use figment::providers::{Env, Format, Toml};
 use http::Uri;
 use nestor::{
-    BlockSize, CacheConfig, Compression, Consistency, DiskConfig, FetchPolicy, HedgeConfig,
+    BlockSize, CacheConfig, Compression, Consistency, DiskConfig, DiskIo, FetchPolicy, HedgeConfig,
     NamespaceConfig, NestorBuilder, RecoverMode,
 };
 use nestor_client::{ClusterConfig, Credentials, Membership};
@@ -267,6 +267,8 @@ pub struct Disk {
     pub direct_io: bool,
     pub compression: DiskCompression,
     pub recover: DiskRecovery,
+    pub io: DiskIo,
+    pub runtime_threads: Option<usize>,
 }
 
 impl Default for Disk {
@@ -279,6 +281,8 @@ impl Default for Disk {
             direct_io: defaults.direct_io,
             compression: DiskCompression::None,
             recover: DiskRecovery::Quiet,
+            io: defaults.io,
+            runtime_threads: None,
         }
     }
 }
@@ -290,6 +294,8 @@ impl Disk {
         config.direct_io = self.direct_io;
         config.compression = self.compression.into();
         config.recover = self.recover.into();
+        config.io = self.io;
+        config.runtime_threads = self.runtime_threads;
         Ok(config)
     }
 }
@@ -488,6 +494,7 @@ mod tests {
     use std::time::Duration;
 
     use figment::Jail;
+    use nestor::HedgeAfter;
 
     use super::*;
 
@@ -576,6 +583,47 @@ mod tests {
                 namespace.fetch.hedge.unwrap().min,
                 Duration::from_millis(20)
             );
+            assert_eq!(
+                namespace.fetch.hedge.unwrap().after,
+                HedgeAfter::Factor(3.0)
+            );
+            assert_eq!(disk.io, DiskIo::Auto);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn parses_disk_io_and_quantile_hedge() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "nestor.toml",
+                r#"
+                [cache.disk]
+                path = "/var/lib/nestor"
+                io = "psync"
+                runtime_threads = 8
+
+                [buckets.fetch]
+                hedge = { quantile = 0.99, min = "10ms", max = "1s" }
+                "#,
+            )?;
+            let config = Config::load(Some(Path::new("nestor.toml"))).unwrap();
+            let disk = config.cache.disk.as_ref().unwrap().build().unwrap();
+            assert_eq!(disk.io, DiskIo::Psync);
+            assert_eq!(disk.runtime_threads(), 8);
+            assert_eq!(
+                config.buckets.fetch.hedge,
+                Some(
+                    HedgeConfig::quantile(0.99, Duration::from_millis(10), Duration::from_secs(1))
+                        .unwrap()
+                )
+            );
+
+            jail.create_file(
+                "both.toml",
+                "[buckets.fetch]\nhedge = { factor = 2.0, quantile = 0.99 }\n",
+            )?;
+            assert!(Config::load(Some(Path::new("both.toml"))).is_err());
             Ok(())
         });
     }

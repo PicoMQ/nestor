@@ -9,7 +9,7 @@ mod transport;
 
 pub use origin::ObjectStoreOrigin;
 pub use store::NestorStore;
-pub use transport::Transport;
+pub use transport::{SharedClient, Transport};
 
 #[cfg(test)]
 mod tests {

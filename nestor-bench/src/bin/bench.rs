@@ -11,7 +11,8 @@ use nestor::{FetchOverrides, FetchPolicy};
 use nestor_bench::dataset::{Dataset, DatasetParams, Profile};
 use nestor_bench::proxy::Proxy;
 use nestor_bench::report::{Report, compare};
-use nestor_bench::run::{Runner, Stack};
+use nestor_bench::run::Runner;
+use nestor_bench::service::{Host, Service};
 use nestor_bench::target::{Endpoint, Library, LibraryConfig, Target};
 use nestor_bench::workload::{Params, Scenario};
 use nestor_e2e::s3;
@@ -99,7 +100,8 @@ struct RunArgs {
     #[command(flatten)]
     dataset: DatasetArgs,
 
-    /// S3 endpoint of the origin, the proxy forwards here.
+    /// S3 endpoint of the origin, the proxy forwards here. An `https` origin is read directly with
+    /// the ambient AWS credentials, without the proxy.
     #[arg(long, env = "BENCH_ORIGIN", default_value = "http://127.0.0.1:19200")]
     origin: String,
     #[arg(long, env = "BENCH_BUCKET", default_value = nestor_e2e::BUCKET)]
@@ -116,12 +118,13 @@ struct RunArgs {
     endpoint: String,
     #[arg(long, default_value = "http://127.0.0.1:19303")]
     endpoint_metrics: String,
-    /// Container name of the nestor binary, for RSS sampling.
-    #[arg(long, default_value = "nestor-bench-nestor-1")]
-    container: String,
-    /// Compose file that runs the nestor binary, for the restart scenario.
-    #[arg(long)]
+    /// Compose file whose `nestor` service is the binary, for restarts and RSS.
+    #[arg(long, conflicts_with = "systemd")]
     compose: Option<PathBuf>,
+    /// Systemd unit running the binary, for restarts and RSS. Needs permission to control the unit,
+    /// and `--disk-path` is what a cold start wipes.
+    #[arg(long)]
+    systemd: Option<String>,
 
     #[command(flatten)]
     cache: CacheArgs,
@@ -144,6 +147,7 @@ struct RunArgs {
 struct CacheArgs {
     #[arg(long, value_parser = parse_bytes, default_value = "1 GiB")]
     memory: u64,
+    /// Disk tier directory, the library's or the systemd endpoint's. Emptied so every run starts cold.
     #[arg(long)]
     disk_path: Option<PathBuf>,
     #[arg(long, value_parser = parse_bytes, default_value = "8 GiB")]
@@ -267,7 +271,25 @@ struct Opened {
     target: Arc<dyn Target>,
     config: serde_json::Value,
     library: Option<Arc<Library>>,
-    stack: Option<Stack>,
+    service: Option<Service>,
+}
+
+fn service(args: &RunArgs) -> Option<Service> {
+    let host = match (&args.compose, &args.systemd) {
+        (Some(file), _) => Host::Compose {
+            file: file.clone(),
+            service: "nestor".into(),
+        },
+        (None, Some(unit)) => Host::Systemd {
+            unit: unit.clone(),
+            disk: args.cache.disk_path.clone(),
+        },
+        (None, None) => return None,
+    };
+    Some(Service {
+        host,
+        health: format!("{}/-/health", args.endpoint),
+    })
 }
 
 fn origin_client(args: &RunArgs, direct: bool) -> eyre::Result<Arc<dyn ObjectStore>> {
@@ -298,26 +320,22 @@ async fn open_target(args: &RunArgs, direct: bool) -> eyre::Result<Opened> {
                 target: Arc::clone(&lib) as Arc<dyn Target>,
                 config: serde_json::to_value(&config)?,
                 library: Some(lib),
-                stack: None,
+                service: None,
             })
         }
         TargetKind::Endpoint => {
-            let stack = args.compose.clone().map(|compose| Stack {
-                compose,
-                service: "nestor".into(),
-                health: format!("{}/-/health", args.endpoint),
-            });
+            let service = service(args);
             let target = Endpoint::new(
                 "endpoint",
-                s3::origin(&args.endpoint),
+                s3::origin_at(&args.endpoint, &args.bucket),
                 Some(args.endpoint_metrics.clone()),
-                Some(args.container.clone()),
+                service.clone(),
             );
             Ok(Opened {
                 target: Arc::new(target),
                 config: serde_json::json!({ "endpoint": args.endpoint, "block": args.cache.block }),
                 library: None,
-                stack,
+                service,
             })
         }
         TargetKind::Origin => Ok(Opened {
@@ -329,7 +347,7 @@ async fn open_target(args: &RunArgs, direct: bool) -> eyre::Result<Opened> {
             )),
             config: serde_json::json!({ "origin": args.origin, "bucket": args.bucket }),
             library: None,
-            stack: None,
+            service: None,
         }),
     }
 }
@@ -345,27 +363,24 @@ async fn run(args: RunArgs) -> eyre::Result<()> {
     };
 
     let direct = direct_origin(&args.origin);
-    let proxy = Proxy::new(if direct {
-        String::from("127.0.0.1:9")
-    } else {
-        authority(&args.origin)?
-    });
-    let serving = if direct {
-        None
-    } else {
-        let serving = tokio::spawn(Arc::clone(&proxy).serve(args.proxy_listen));
+    let mut proxy = None;
+    let mut serving = None;
+    if !direct {
+        let p = Proxy::new(authority(&args.origin)?);
+        let task = tokio::spawn(Arc::clone(&p).serve(args.proxy_listen));
         tokio::time::sleep(Duration::from_millis(50)).await;
-        eyre::ensure!(!serving.is_finished(), "proxy failed to start");
-        Some(serving)
-    };
+        eyre::ensure!(!task.is_finished(), "proxy failed to start");
+        proxy = Some(p);
+        serving = Some(task);
+    }
 
     let opened = open_target(&args, direct).await?;
     let runner = Runner {
         target: Arc::clone(&opened.target),
-        proxy: Arc::clone(&proxy),
+        proxy,
         dataset: Arc::clone(&dataset),
         verify: args.verify,
-        stack: opened.stack,
+        service: opened.service,
     };
     let phases = args.scenario.phases(&dataset, &params);
     let outcome = runner.run(phases).await?;

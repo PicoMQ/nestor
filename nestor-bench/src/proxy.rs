@@ -172,6 +172,7 @@ impl Proxy {
             .wrap_err_with(|| format!("bind proxy on {listen}"))?;
         loop {
             let (stream, _) = listener.accept().await?;
+            stream.set_nodelay(true)?;
             let proxy = Arc::clone(&self);
             tokio::spawn(async move {
                 let service = service_fn(move |req| Arc::clone(&proxy).forward(req));

@@ -2,6 +2,8 @@
 //! `object_lru` is the small in-memory LRU used for per-object bookkeeping.
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use foyer::{
     BlockEngineConfig, Cache, CacheBuilder, CacheProperties, Compression, DeviceBuilder,
@@ -17,6 +19,21 @@ pub type BlockCache = HybridCache<BlockKey, Block>;
 const MIB: usize = 1024 * 1024;
 const MIN_SHARD_BYTES: usize = 32 * MIB;
 const MAX_BUFFER_POOL: usize = 256 * MIB;
+#[cfg(target_os = "linux")]
+const URING_DEPTH: u32 = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "snake_case")
+)]
+pub enum DiskIo {
+    #[default]
+    Auto,
+    Uring,
+    Psync,
+}
 
 #[derive(Debug, Clone)]
 pub struct DiskConfig {
@@ -29,6 +46,8 @@ pub struct DiskConfig {
     pub direct_io: bool,
     pub compression: Compression,
     pub recover: RecoverMode,
+    pub io: DiskIo,
+    pub runtime_threads: Option<usize>,
 }
 
 impl DiskConfig {
@@ -43,7 +62,14 @@ impl DiskConfig {
             direct_io: true,
             compression: Compression::None,
             recover: RecoverMode::Quiet,
+            io: DiskIo::Auto,
+            runtime_threads: None,
         }
+    }
+
+    pub fn runtime_threads(&self) -> usize {
+        self.runtime_threads
+            .unwrap_or(self.flushers + self.reclaimers)
     }
 
     pub fn buffer_pool(&self) -> usize {
@@ -127,28 +153,64 @@ pub async fn build(
         .with_buffer_pool_size(disk.buffer_pool())
         .with_indexer_shards(config.shards.max(64));
 
-    let storage = storage
+    let threads = disk.runtime_threads();
+    if threads == 0 {
+        return Err(foyer::Error::new(
+            foyer::ErrorKind::Config,
+            "disk runtime_threads must be at least 1",
+        ));
+    }
+    let next_thread = Arc::new(AtomicUsize::new(0));
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(threads)
+        .thread_name_fn(move || format!("foyer-{}", next_thread.fetch_add(1, Ordering::Relaxed)))
+        .enable_all()
+        .build()
+        .map_err(foyer::Error::io_error)?;
+
+    storage
         .with_engine_config(engine)
         .with_recover_mode(disk.recover)
-        .with_compression(disk.compression);
+        .with_compression(disk.compression)
+        .with_spawner(runtime.into())
+        .with_io_engine_config(io_engine(disk.io)?)
+        .build()
+        .await
+}
 
-    storage.with_io_engine_config(io_engine()).build().await
+fn io_engine(io: DiskIo) -> foyer::Result<Box<dyn foyer::IoEngineConfig>> {
+    match io {
+        DiskIo::Psync => Ok(Box::new(foyer::PsyncIoEngineConfig::new())),
+        DiskIo::Uring => uring_engine(true),
+        DiskIo::Auto => uring_engine(false),
+    }
 }
 
 #[cfg(target_os = "linux")]
-fn io_engine() -> Box<dyn foyer::IoEngineConfig> {
-    match io_uring::IoUring::new(2) {
-        Ok(_) => Box::new(foyer::UringIoEngineConfig::new()),
+fn uring_engine(required: bool) -> foyer::Result<Box<dyn foyer::IoEngineConfig>> {
+    match io_uring::IoUring::new(URING_DEPTH) {
+        Ok(_) => Ok(Box::new(foyer::UringIoEngineConfig::new())),
+        Err(e) if required => Err(foyer::Error::new(
+            foyer::ErrorKind::Config,
+            format!("io_uring unavailable: {e}"),
+        )),
         Err(e) => {
             tracing::warn!(error = %e, "io_uring unavailable, disk tier uses psync");
-            Box::new(foyer::PsyncIoEngineConfig::new())
+            Ok(Box::new(foyer::PsyncIoEngineConfig::new()))
         }
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn io_engine() -> Box<dyn foyer::IoEngineConfig> {
-    Box::new(foyer::PsyncIoEngineConfig::new())
+fn uring_engine(required: bool) -> foyer::Result<Box<dyn foyer::IoEngineConfig>> {
+    if required {
+        Err(foyer::Error::new(
+            foyer::ErrorKind::Config,
+            "io_uring requires Linux",
+        ))
+    } else {
+        Ok(Box::new(foyer::PsyncIoEngineConfig::new()))
+    }
 }
 
 pub(crate) type ObjectCache<V> = Cache<ObjectKey, V, ahash::RandomState, CacheProperties>;
@@ -167,7 +229,7 @@ pub(crate) fn object_lru<V: Send + Sync + 'static>(
 
 #[cfg(test)]
 mod tests {
-    use super::{CacheConfig, DiskConfig, MAX_BUFFER_POOL, MIB, MIN_SHARD_BYTES};
+    use super::{CacheConfig, DiskConfig, DiskIo, MAX_BUFFER_POOL, MIB, MIN_SHARD_BYTES};
 
     #[test]
     fn shards_never_fall_under_the_minimum_size() {
@@ -190,5 +252,16 @@ mod tests {
         let mut pinned = DiskConfig::new("/tmp", 256 * MIB);
         pinned.buffer_pool_size = Some(MIB);
         assert_eq!(pinned.buffer_pool(), MIB);
+    }
+
+    #[test]
+    fn runtime_threads_follow_flushers_and_reclaimers_unless_set() {
+        let mut disk = DiskConfig::new("/tmp", MIB);
+        assert_eq!(disk.io, DiskIo::Auto);
+        assert_eq!(disk.runtime_threads(), 4);
+        disk.flushers = 6;
+        assert_eq!(disk.runtime_threads(), 8);
+        disk.runtime_threads = Some(2);
+        assert_eq!(disk.runtime_threads(), 2);
     }
 }

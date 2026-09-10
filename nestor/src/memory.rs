@@ -1,4 +1,4 @@
-//! In-memory `Origin` for tests. Latency, slow responses and failures can be injected
+//! In-memory `Origin` for tests. Latency, slow responses, body stalls and failures can be injected
 //! per call.
 
 use std::collections::HashMap;
@@ -35,6 +35,7 @@ pub struct MemoryOrigin {
     chunk: usize,
     latency: Mutex<Duration>,
     slow: Mutex<Option<(usize, Duration)>>,
+    stall: Mutex<Option<(usize, Duration)>>,
     failures: Mutex<usize>,
     fail_every: AtomicUsize,
     versions: AtomicU64,
@@ -54,6 +55,7 @@ impl MemoryOrigin {
             chunk: 64 * 1024,
             latency: Mutex::new(Duration::ZERO),
             slow: Mutex::new(None),
+            stall: Mutex::new(None),
             failures: Mutex::new(0),
             fail_every: AtomicUsize::new(0),
             versions: AtomicU64::new(1),
@@ -101,6 +103,10 @@ impl MemoryOrigin {
         *self.slow.lock().unwrap() = Some((count, latency));
     }
 
+    pub fn stall_next(&self, count: usize, delay: Duration) {
+        *self.stall.lock().unwrap() = Some((count, delay));
+    }
+
     pub fn fail_next(&self, count: usize) {
         *self.failures.lock().unwrap() = count;
     }
@@ -123,22 +129,16 @@ impl MemoryOrigin {
 
     fn delay(&self) -> Duration {
         let base = *self.latency.lock().unwrap();
-        let mut slow = self.slow.lock().unwrap();
-        match slow.as_mut() {
-            Some((remaining, extra)) if *remaining > 0 => {
-                *remaining -= 1;
-                base + *extra
-            }
-            _ => base,
-        }
+        base + take_injected(&self.slow)
     }
 
     async fn simulate_network(&self) -> Result<(), OriginError> {
+        let failing = self.take_failure();
         let delay = self.delay();
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        if self.take_failure() {
+        if failing {
             return Err(OriginError::io(std::io::Error::other("injected failure")));
         }
         Ok(())
@@ -151,6 +151,17 @@ impl MemoryOrigin {
             .get(object)
             .cloned()
             .ok_or(OriginError::NotFound)
+    }
+}
+
+fn take_injected(slot: &Mutex<Option<(usize, Duration)>>) -> Duration {
+    let mut slot = slot.lock().unwrap();
+    match slot.as_mut() {
+        Some((remaining, delay)) if *remaining > 0 => {
+            *remaining -= 1;
+            *delay
+        }
+        _ => Duration::ZERO,
     }
 }
 
@@ -195,14 +206,20 @@ impl Origin for MemoryOrigin {
             .bytes
             .fetch_add(body.len() as u64, Ordering::Relaxed);
         let chunk = self.chunk;
-        let chunks: Vec<Bytes> = (0..body.len())
+        let stall = take_injected(&self.stall);
+        let chunks = (0..body.len())
             .step_by(chunk)
-            .map(|start| body.slice(start..(start + chunk).min(body.len())))
-            .collect();
+            .map(move |start| body.slice(start..(start + chunk).min(body.len())));
+        let body = stream::iter(chunks.enumerate()).then(move |(i, chunk)| async move {
+            if i == 1 && !stall.is_zero() {
+                tokio::time::sleep(stall).await;
+            }
+            Ok(chunk)
+        });
         Ok(GetResponse {
             meta,
             range,
-            body: stream::iter(chunks.into_iter().map(Ok)).boxed(),
+            body: body.boxed(),
         })
     }
 

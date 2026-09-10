@@ -7,7 +7,7 @@ The `nestor` crate is the engine. It has no opinion about S3, HTTP or where obje
 nestor = { git = "https://github.com/picomq/nestor" }
 ```
 
-The `serde` feature derives `Deserialize` for `NamespaceConfig`, `Consistency`, `HedgeConfig` and `RetryConfig`, for applications that want the same TOML shape as the binary.
+The `serde` feature derives `Deserialize` for `NamespaceConfig`, `Consistency`, `FetchPolicy` and `HedgeConfig`, for applications that want the same TOML shape as the binary.
 
 ## Building
 
@@ -47,7 +47,7 @@ let nestor = Nestor::builder(cache)
 | `meta_capacity` | `100000` | Objects whose size and `ETag` are remembered. |
 | `metrics_registry` | none | A `mixtrics` registry for foyer's tier metrics. Engine metrics use the `metrics` facade regardless. |
 
-`Namespace` takes the same settings as `[buckets]` in the binary: `block_size`, `fetch_window`, `read_window`, `consistency`, `readahead` and `fetch`. `fetch` is a [`FetchPolicy`](/docs/design/fetches#fetch-policy), `FetchPolicy::default().hedge(None)` disables hedging. A `NamespaceConfig` can be built once and applied with `config`.
+`Namespace` takes the same settings as `[buckets]` in the binary: `block_size`, `fetch_window`, `read_window`, `consistency`, `readahead` and `fetch`. `fetch` is a [`FetchPolicy`](/docs/design/fetches#fetch-policy), `FetchPolicy::default().hedge(None)` disables hedging and `HedgeConfig::factor(..)` or `HedgeConfig::quantile(..)` build a validated hedge rule. A `NamespaceConfig` can be built once and applied with `config`.
 
 Build the `object_store` client under an `ObjectStoreOrigin` with `nestor_store::Transport`, which turns client retries and request timeout off:
 
