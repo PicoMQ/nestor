@@ -1,0 +1,26 @@
+[server]
+listen = "127.0.0.1:19302"
+metrics = "127.0.0.1:19303"
+
+[origin]
+endpoint = "https://s3.${region}.amazonaws.com"
+region = "${region}"
+credentials = { source = "default" }
+
+[auth]
+mode = "static"
+access_key = "nestor"
+secret_key = "nestornestor"
+
+[cache]
+memory = "1 GiB"
+
+[cache.disk]
+path = "/var/lib/nestor"
+capacity = "8 GiB"
+io = "uring"
+
+[buckets]
+block_size = "1 MiB"
+consistency = { mode = "immutable" }
+readahead = 0

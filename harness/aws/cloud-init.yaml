@@ -1,0 +1,27 @@
+#cloud-config
+packages:
+  - docker
+
+write_files:
+  - path: /etc/nestor/nestor.toml
+    permissions: "0644"
+    encoding: b64
+    content: ${nestor_toml_b64}
+  - path: /etc/systemd/system/nestor.service
+    permissions: "0644"
+    encoding: b64
+    content: ${nestor_service_b64}
+
+runcmd:
+  - |
+    set -euo pipefail
+    device=$(lsblk -dno NAME,MODEL | awk '/Instance Storage/ { print "/dev/" $1; exit }')
+    mkdir -p /mnt/nvme
+    if [ -n "$device" ]; then
+      mkfs.xfs -f "$device"
+      mount -o noatime "$device" /mnt/nvme
+      grep -q ' /mnt/nvme ' /etc/fstab || echo "$device /mnt/nvme xfs defaults,noatime,nofail 0 2" >> /etc/fstab
+    fi
+    mkdir -p /mnt/nvme/nestor
+    systemctl enable --now docker
+    systemctl enable --now nestor
