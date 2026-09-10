@@ -4,6 +4,7 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, RwLock};
 
+use nestor_store::SharedClient;
 use tokio::task::JoinHandle;
 
 use crate::config::ClusterConfig;
@@ -15,6 +16,7 @@ use crate::router::Ranked;
 
 pub struct Cluster {
     config: ClusterConfig,
+    client: SharedClient,
     membership: Membership,
     nodes: RwLock<Arc<[Arc<Node>]>>,
     refresher: Mutex<Option<JoinHandle<()>>>,
@@ -29,12 +31,17 @@ impl Cluster {
         if addrs.is_empty() {
             return Err(ClusterError::NoNodes);
         }
+        let client = config
+            .transport
+            .shared_client()
+            .map_err(ClusterError::Transport)?;
         let nodes: Arc<[Arc<Node>]> = addrs
             .into_iter()
-            .map(|addr| Arc::new(Node::new(addr, &config)))
+            .map(|addr| Arc::new(Node::new(addr, &config, client.clone())))
             .collect();
         let cluster = Arc::new(Self {
             config,
+            client,
             membership,
             nodes: RwLock::new(nodes),
             refresher: Mutex::new(None),
@@ -92,7 +99,7 @@ impl Cluster {
                     Arc::clone(node)
                 } else {
                     added += 1;
-                    Arc::new(Node::new(*addr, &self.config))
+                    Arc::new(Node::new(*addr, &self.config, self.client.clone()))
                 }
             })
             .collect();

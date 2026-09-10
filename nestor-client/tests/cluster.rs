@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use axum::serve::ListenerExt;
 use bytes::Bytes;
 use futures::TryStreamExt;
 use http::Uri;
@@ -120,6 +121,9 @@ impl Nodes {
             let router = S3Service::new(nestor, config).router();
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             addrs.push(listener.local_addr().unwrap());
+            let listener = listener.tap_io(|stream| {
+                stream.set_nodelay(true).unwrap();
+            });
             tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
             origins.push(origin);
         }

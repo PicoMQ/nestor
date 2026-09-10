@@ -95,11 +95,13 @@ mod tests {
 
     fn nodes(count: u16) -> Vec<Arc<Node>> {
         let config = ClusterConfig::default();
+        let client = config.transport.shared_client().unwrap();
         (0..count)
             .map(|i| {
                 Arc::new(Node::new(
                     SocketAddr::from((Ipv4Addr::new(10, 0, 0, 1), 9000 + i)),
                     &config,
+                    client.clone(),
                 ))
             })
             .collect()
@@ -165,11 +167,13 @@ mod tests {
             load_limit: 1,
             ..ClusterConfig::default()
         };
+        let client = config.transport.shared_client().unwrap();
         let cluster: Vec<Arc<Node>> = (0..3)
             .map(|i| {
                 Arc::new(Node::new(
                     SocketAddr::from((Ipv4Addr::LOCALHOST, 9000 + i)),
                     &config,
+                    client.clone(),
                 ))
             })
             .collect();

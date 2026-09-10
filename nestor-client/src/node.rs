@@ -8,7 +8,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use nestor::{Latency, Origin};
-use nestor_store::{ObjectStoreOrigin, Transport};
+use nestor_store::{ObjectStoreOrigin, SharedClient, Transport};
 use object_store::StaticCredentialProvider;
 use object_store::aws::{AmazonS3Builder, AwsCredential, AwsCredentialProvider};
 
@@ -24,6 +24,7 @@ pub(crate) struct Node {
     endpoint: String,
     credentials: Option<AwsCredentialProvider>,
     transport: Transport,
+    client: SharedClient,
     load_limit: usize,
     inflight: AtomicUsize,
     epoch: Instant,
@@ -33,7 +34,7 @@ pub(crate) struct Node {
 }
 
 impl Node {
-    pub fn new(addr: SocketAddr, config: &ClusterConfig) -> Self {
+    pub fn new(addr: SocketAddr, config: &ClusterConfig, client: SharedClient) -> Self {
         let scheme = if config.tls { "https" } else { "http" };
         let credentials = config.credentials.as_ref().map(|c| {
             Arc::new(StaticCredentialProvider::new(AwsCredential {
@@ -48,6 +49,7 @@ impl Node {
             endpoint: format!("{scheme}://{addr}"),
             credentials,
             transport: config.transport,
+            client,
             load_limit: config.load_limit.max(1),
             inflight: AtomicUsize::new(0),
             epoch: Instant::now(),
@@ -122,7 +124,7 @@ impl Node {
             .with_bucket_name(bucket.as_ref())
             .with_region(REGION)
             .with_endpoint(&self.endpoint)
-            .with_client_options(self.transport.client_options())
+            .with_http_connector(self.client.clone())
             .with_retry(self.transport.retry_config());
         builder = match &self.credentials {
             Some(provider) => builder.with_credentials(Arc::clone(provider)),

@@ -13,6 +13,8 @@ pub enum ClusterError {
         #[source]
         source: std::io::Error,
     },
+    #[error("building http client: {0}")]
+    Transport(#[source] object_store::Error),
     #[error("building client for node {node}: {source}")]
     Client {
         node: String,
