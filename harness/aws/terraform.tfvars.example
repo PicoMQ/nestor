@@ -1,0 +1,3 @@
+region        = "us-east-1"
+instance_type = "i4i.xlarge"
+image         = "ghcr.io/picomq/nestor:latest"

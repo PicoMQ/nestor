@@ -1,0 +1,15 @@
+[Unit]
+Description=nestor
+After=docker.service
+Requires=docker.service
+
+[Service]
+Restart=on-failure
+TimeoutStopSec=45
+TimeoutStartSec=300
+ExecStartPre=-/usr/bin/docker rm -f nestor
+ExecStart=/usr/bin/docker run --rm --name nestor --network host --security-opt seccomp=unconfined --ulimit nofile=1048576:1048576 -v /etc/nestor/nestor.toml:/etc/nestor/nestor.toml:ro -v /mnt/nvme/nestor:/var/lib/nestor ${image}
+ExecStop=/usr/bin/docker stop nestor
+
+[Install]
+WantedBy=multi-user.target
