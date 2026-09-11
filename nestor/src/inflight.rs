@@ -121,9 +121,11 @@ impl Inflight {
             .remove(key);
     }
 
-    #[cfg(test)]
     pub fn len(&self) -> usize {
-        self.shards.iter().map(|s| s.lock().unwrap().len()).sum()
+        self.shards
+            .iter()
+            .map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).len())
+            .sum()
     }
 }
 

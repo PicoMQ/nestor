@@ -32,6 +32,7 @@ pub(crate) struct Engine {
     pub(crate) fetcher: Arc<Fetcher>,
     pub(crate) meta: Arc<MetaCache>,
     readahead: Readahead,
+    disk_cap: Option<usize>,
     closed: AtomicBool,
 }
 
@@ -89,6 +90,29 @@ impl Engine {
             policy,
         ))
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheSnapshot {
+    pub memory_used: usize,
+    pub memory_cap: usize,
+    pub disk_cap: Option<usize>,
+    pub meta_used: usize,
+    pub meta_cap: usize,
+    pub inflight: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct NamespaceSnapshot {
+    pub name: Arc<str>,
+    pub id: NamespaceId,
+    pub config: crate::namespace::NamespaceConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct NodeSnapshot {
+    pub cache: CacheSnapshot,
+    pub namespaces: Vec<NamespaceSnapshot>,
 }
 
 #[derive(Clone)]
@@ -184,6 +208,7 @@ impl NestorBuilder {
             fetcher,
             meta,
             readahead: Readahead::new(self.meta_capacity),
+            disk_cap: self.cache.disk.as_ref().map(|disk| disk.capacity),
             closed: AtomicBool::new(false),
         });
         let nestor = Nestor { engine };
@@ -227,16 +252,40 @@ impl Nestor {
     }
 
     pub fn namespaces(&self) -> Vec<(Arc<str>, NamespaceId)> {
+        self.snapshot()
+            .namespaces
+            .into_iter()
+            .map(|ns| (ns.name, ns.id))
+            .collect()
+    }
+
+    pub fn snapshot(&self) -> NodeSnapshot {
         let registry = self
             .engine
             .registry
             .read()
             .unwrap_or_else(|e| e.into_inner());
-        registry
-            .states
-            .iter()
-            .map(|s| (Arc::clone(&s.name), s.id))
-            .collect()
+        let cache = &self.engine.fetcher.cache;
+        let memory = cache.memory();
+        NodeSnapshot {
+            cache: CacheSnapshot {
+                memory_used: memory.usage(),
+                memory_cap: memory.capacity(),
+                disk_cap: self.engine.disk_cap.filter(|_| cache.is_hybrid()),
+                meta_used: self.engine.meta.usage(),
+                meta_cap: self.engine.meta.capacity(),
+                inflight: self.engine.fetcher.inflight(),
+            },
+            namespaces: registry
+                .states
+                .iter()
+                .map(|s| NamespaceSnapshot {
+                    name: Arc::clone(&s.name),
+                    id: s.id,
+                    config: s.config,
+                })
+                .collect(),
+        }
     }
 
     fn state(&self, ns: NamespaceId) -> Result<Arc<NamespaceState>> {

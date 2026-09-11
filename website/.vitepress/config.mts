@@ -28,6 +28,7 @@ const docsSidebar = [
     items: [
       { text: 'Configuration', link: '/docs/operations/configuration' },
       { text: 'Deployment', link: '/docs/operations/deployment' },
+      { text: 'Admin API & dashboard', link: '/docs/operations/admin' },
       { text: 'Metrics', link: '/docs/operations/metrics' },
       { text: 'Tuning', link: '/docs/operations/tuning' },
     ],

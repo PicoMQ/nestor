@@ -3,3 +3,5 @@ website/
 .git/
 .github/
 Dockerfile
+dashboard/node_modules/
+nestor-server/_dashboard/

@@ -10,6 +10,11 @@
 nestor-bench/reports/
 harness/aws/bench/
 
+dashboard/node_modules/
+dashboard/tsconfig.tsbuildinfo
+nestor-server/_dashboard/*
+!nestor-server/_dashboard/.gitkeep
+
 website/node_modules/
 website/.vitepress/cache/
 website/.vitepress/dist/

@@ -100,6 +100,10 @@ impl Fetcher {
         })
     }
 
+    pub fn inflight(&self) -> usize {
+        self.inflight.len()
+    }
+
     pub async fn schedule(
         self: &Arc<Self>,
         ctx: &Arc<ReadCtx>,

@@ -1,7 +1,7 @@
 # One nestor in front of RustFS.
 # From the repository root: docker build -t nestor-e2e:local . && docker compose -f nestor-e2e/single/compose.yml up
 #
-# S3 through nestor: http://localhost:19001, metrics http://localhost:19100
+# S3 through nestor: http://localhost:19001, metrics http://localhost:19100, admin http://localhost:19190
 # RustFS directly:    http://localhost:19000
 
 name: nestor-e2e-single
@@ -51,8 +51,9 @@ services:
     ports:
       - "19001:9000"
       - "19100:9100"
+      - "19190:9190"
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/-/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/-/health && curl -fsS http://127.0.0.1:9190/ready || exit 1"]
       interval: 2s
       timeout: 5s
       retries: 30

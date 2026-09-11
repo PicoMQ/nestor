@@ -716,3 +716,24 @@ async fn probe_and_head_are_retried() {
     );
     assert_eq!(second.heads(), 2);
 }
+
+#[tokio::test]
+async fn snapshot_reports_live_cache_state() {
+    let origin = Arc::new(MemoryOrigin::new());
+    let data = pattern(BLOCK as usize);
+    origin.put("obj", data.clone());
+    let (nestor, id) = engine(namespace(origin, Consistency::Immutable)).await;
+
+    nestor.insert(id, "obj", None, &data).unwrap();
+    let snap = nestor.snapshot();
+    assert_eq!(snap.namespaces.len(), 1);
+    assert_eq!(snap.namespaces[0].name.as_ref(), "test");
+    assert_eq!(snap.namespaces[0].id, id);
+    assert_eq!(snap.namespaces[0].config.block_size.bytes(), BLOCK);
+    assert_eq!(snap.cache.memory_cap, 64 * 1024 * 1024);
+    assert!(snap.cache.disk_cap.is_none());
+    assert!(snap.cache.meta_used >= 1);
+    assert!(snap.cache.meta_cap >= snap.cache.meta_used);
+    assert!(snap.cache.memory_used > 0);
+    assert_eq!(snap.cache.inflight, 0);
+}
