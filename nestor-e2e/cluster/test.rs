@@ -57,12 +57,12 @@ impl Stack {
         }
     }
 
-    async fn node_admin_origin_requests(&self) -> Vec<u64> {
-        let mut requests = Vec::with_capacity(self.node_admins.len());
+    async fn node_admin_origin_bytes(&self) -> Vec<u64> {
+        let mut bytes = Vec::with_capacity(self.node_admins.len());
         for admin in &self.node_admins {
-            requests.push(admin.origin_requests().await);
+            bytes.push(admin.origin_bytes().await);
         }
-        requests
+        bytes
     }
 
     async fn node_origin_bytes(&self) -> Vec<u64> {
@@ -159,29 +159,34 @@ async fn writes_warm_the_owning_nodes() {
 async fn every_node_and_the_gateway_expose_admin_state() {
     let stack = Stack::connect().await;
     let key = Path::from("cluster/admin");
-    let data = payload(12 * MIB, 12);
+    let data = payload(64 * MIB, 65);
     stack
         .origin
         .put(&key, data.clone().into())
         .await
         .expect("put");
 
-    let before = stack.node_admin_origin_requests().await;
+    let before = stack.node_admin_origin_bytes().await;
     let gateway_before = stack.gateway_admin.status().await;
     assert_eq!(stack.read(&key).await, data);
-    let after = stack.node_admin_origin_requests().await;
+    let after = stack.node_admin_origin_bytes().await;
     let fetched: Vec<u64> = before.iter().zip(&after).map(|(b, a)| a - b).collect();
-    step!(?fetched, "origin requests per node from /admin/status");
+    step!(?fetched, "origin bytes per node from /admin/status");
     assert!(
         fetched.iter().all(|f| *f > 0),
         "every node admin should report origin traffic for its blocks"
+    );
+    assert_eq!(
+        fetched.iter().sum::<u64>(),
+        (64 * MIB) as u64,
+        "node admins should account for every origin byte exactly once"
     );
 
     for (i, admin) in stack.node_admins.iter().enumerate() {
         let metrics = Metrics::scrape(&stack.nodes[i]).await;
         assert_eq!(
-            admin.origin_requests().await,
-            metrics.counter("nestor_origin_requests_total"),
+            admin.origin_bytes().await,
+            metrics.counter(ORIGIN_BYTES),
             "node{} admin disagrees with its metrics",
             i + 1
         );
@@ -195,7 +200,7 @@ async fn every_node_and_the_gateway_expose_admin_state() {
     let gateway_after = stack.gateway_admin.status().await;
     assert!(
         gateway_after["totals"]["bytesServed"].as_u64().unwrap()
-            >= gateway_before["totals"]["bytesServed"].as_u64().unwrap() + (12 * MIB) as u64
+            >= gateway_before["totals"]["bytesServed"].as_u64().unwrap() + (64 * MIB) as u64
     );
     let ready = stack.gateway_admin.ready().await;
     assert_eq!(ready["ready"], true);

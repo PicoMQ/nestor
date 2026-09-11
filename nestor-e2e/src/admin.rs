@@ -49,6 +49,12 @@ impl Admin {
             .expect("totals.originRequests")
     }
 
+    pub async fn origin_bytes(&self) -> u64 {
+        self.status().await["totals"]["originBytes"]
+            .as_u64()
+            .expect("totals.originBytes")
+    }
+
     pub async fn page(&self, path: &str) -> Page {
         let response = reqwest::get(format!("{}{path}", self.base))
             .await
