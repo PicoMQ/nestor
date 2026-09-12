@@ -95,8 +95,4 @@ onBeforeUnmount(() => {
     Nestor is a block cache for S3-compatible object storage,<br />
     in RAM and on local disk, as a library or an S3 endpoint.
   </p>
-  <p class="kakapo-hero-tags">
-    <span>Open source</span>
-    <span>Built with Rust</span>
-  </p>
 </template>
