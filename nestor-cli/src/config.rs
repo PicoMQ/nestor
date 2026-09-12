@@ -66,6 +66,15 @@ impl Config {
                  socket can read every cached object"
             );
         }
+        if self.server.admin.enabled
+            && !self.server.admin.listen.ip().is_loopback()
+            && !self.server.admin.insecure_allow_remote
+        {
+            bail!(
+                "server.admin.listen ({}) is not loopback; set server.admin.insecure_allow_remote = true to bind it",
+                self.server.admin.listen
+            );
+        }
         Ok(())
     }
 
@@ -92,6 +101,7 @@ pub struct Server {
     pub tls: Option<Tls>,
     pub metrics: Option<SocketAddr>,
     pub addressing: AddressingStyle,
+    pub admin: Admin,
 }
 
 impl Default for Server {
@@ -101,6 +111,25 @@ impl Default for Server {
             tls: None,
             metrics: None,
             addressing: AddressingStyle::default(),
+            admin: Admin::default(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Admin {
+    pub listen: SocketAddr,
+    pub enabled: bool,
+    pub insecure_allow_remote: bool,
+}
+
+impl Default for Admin {
+    fn default() -> Self {
+        Self {
+            listen: SocketAddr::from((Ipv4Addr::LOCALHOST, 9190)),
+            enabled: true,
+            insecure_allow_remote: false,
         }
     }
 }
@@ -502,6 +531,10 @@ mod tests {
     fn defaults_are_loopback_and_anonymous() {
         let config = Config::load(None).unwrap();
         assert!(config.server.listen.ip().is_loopback());
+        assert!(config.server.admin.enabled);
+        assert_eq!(config.server.admin.listen.port(), 9190);
+        assert!(config.server.admin.listen.ip().is_loopback());
+        assert!(!config.server.admin.insecure_allow_remote);
         assert!(matches!(config.auth, AuthMode::Anonymous));
         assert!(matches!(
             config.origin.credentials,
@@ -672,6 +705,28 @@ mod tests {
             )?;
             let config = Config::load(Some(Path::new("both.toml"))).unwrap();
             assert!(config.validate().is_err());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn admin_refuses_non_loopback_without_insecure() {
+        Jail::expect_with(|jail| {
+            jail.create_file("remote.toml", "[server.admin]\nlisten = \"0.0.0.0:9190\"\n")?;
+            let config = Config::load(Some(Path::new("remote.toml"))).unwrap();
+            assert!(config.validate().is_err());
+
+            jail.create_file(
+                "allowed.toml",
+                "[server.admin]\nlisten = \"0.0.0.0:9190\"\ninsecure_allow_remote = true\n",
+            )?;
+            let config = Config::load(Some(Path::new("allowed.toml"))).unwrap();
+            config.validate().unwrap();
+
+            jail.create_file("off.toml", "[server.admin]\nenabled = false\n")?;
+            let config = Config::load(Some(Path::new("off.toml"))).unwrap();
+            assert!(!config.server.admin.enabled);
+            config.validate().unwrap();
             Ok(())
         });
     }

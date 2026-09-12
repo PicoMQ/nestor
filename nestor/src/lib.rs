@@ -29,7 +29,9 @@ pub use latency::Latency;
 pub use memory::MemoryOrigin;
 pub use mixtrics::metrics::BoxedRegistry;
 pub use namespace::{Consistency, Namespace, NamespaceConfig};
-pub use nestor::{Nestor, NestorBuilder, ReadOptions};
+pub use nestor::{
+    CacheSnapshot, NamespaceSnapshot, Nestor, NestorBuilder, NodeSnapshot, ReadOptions,
+};
 pub use origin::{GetOptions, GetResponse, ObjectMeta, Origin, Precondition, Preconditions};
 pub use policy::{
     FetchOverrides, FetchPolicy, HedgeAfter, HedgeConfig, HedgeConfigError, PolicyParseError,

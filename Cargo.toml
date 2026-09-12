@@ -4,6 +4,7 @@ members = [
     "nestor",
     "nestor-store",
     "nestor-s3",
+    "nestor-server",
     "nestor-cli",
     "nestor-client",
     "nestor-e2e",
@@ -22,6 +23,7 @@ repository = "https://github.com/PicoMQ/nestor"
 nestor = { path = "nestor" }
 nestor-store = { path = "nestor-store" }
 nestor-s3 = { path = "nestor-s3" }
+nestor-server = { path = "nestor-server" }
 nestor-client = { path = "nestor-client" }
 
 foyer = "0.22.5"
@@ -62,6 +64,8 @@ humantime-serde = "1.1.1"
 byte-unit = { version = "5.2.5", default-features = false, features = ["serde", "byte", "std"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 mimalloc = "0.1.52"
+rust-embed = "8.12.0"
+serde_json = "1.0.145"
 
 proptest = "1.11.0"
 tempfile = "3.27.0"

@@ -1,8 +1,8 @@
 # Three nestor nodes behind the DNS name `nodes`, and a gateway that routes reads across them.
 # From the repository root: docker build -t nestor-e2e:local . && docker compose -f nestor-e2e/cluster/compose.yml up
 #
-# S3 through the gateway: http://localhost:19001, gateway metrics http://localhost:19100
-# Node metrics: http://localhost:19101, 19102, 19103
+# S3 through the gateway: http://localhost:19001, gateway metrics http://localhost:19100, gateway admin http://localhost:19190
+# Node metrics: http://localhost:19101, 19102, 19103; node admin: 19191, 19192, 19193
 # RustFS directly:        http://localhost:19000
 
 x-node: &node
@@ -19,7 +19,7 @@ x-node: &node
     createbucket:
       condition: service_completed_successfully
   healthcheck:
-    test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/-/health || exit 1"]
+    test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/-/health && curl -fsS http://127.0.0.1:9190/ready || exit 1"]
     interval: 2s
     timeout: 5s
     retries: 30
@@ -62,16 +62,19 @@ services:
     <<: *node
     ports:
       - "19101:9100"
+      - "19191:9190"
 
   node2:
     <<: *node
     ports:
       - "19102:9100"
+      - "19192:9190"
 
   node3:
     <<: *node
     ports:
       - "19103:9100"
+      - "19193:9190"
 
   gateway:
     image: ${NESTOR_IMAGE:-nestor-e2e:local}
@@ -89,8 +92,9 @@ services:
     ports:
       - "19001:9000"
       - "19100:9100"
+      - "19190:9190"
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/-/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/-/health && curl -fsS http://127.0.0.1:9190/ready || exit 1"]
       interval: 2s
       timeout: 5s
       retries: 30

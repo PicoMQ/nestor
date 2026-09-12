@@ -2,6 +2,10 @@
 listen = "0.0.0.0:9000"
 metrics = "0.0.0.0:9100"
 
+[server.admin]
+listen = "0.0.0.0:9190"
+insecure_allow_remote = true
+
 [origin]
 endpoint = "http://rustfs:9000"
 region = "us-east-1"

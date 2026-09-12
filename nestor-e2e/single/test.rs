@@ -5,17 +5,21 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::TryStreamExt;
+use nestor_e2e::admin::Admin;
+use nestor_e2e::compose::Compose;
 use nestor_e2e::data::{KIB, MIB, body, payload, slice};
 use nestor_e2e::metrics::Metrics;
-use nestor_e2e::{env, init, s3, step, wait};
+use nestor_e2e::{BUCKET, env, init, s3, step, wait};
 use object_store::path::Path;
 use object_store::{Error, GetOptions, GetRange, ObjectStore, ObjectStoreExt, WriteMultipart};
+use serde_json::Value;
 
 struct Stack {
     origin: std::sync::Arc<object_store::aws::AmazonS3>,
     nestor: std::sync::Arc<object_store::aws::AmazonS3>,
     nestor_endpoint: String,
     metrics: String,
+    admin: Admin,
 }
 
 impl Stack {
@@ -24,16 +28,19 @@ impl Stack {
         let rustfs = env("NESTOR_E2E_RUSTFS", "http://127.0.0.1:19000");
         let nestor_endpoint = env("NESTOR_E2E_NESTOR", "http://127.0.0.1:19001");
         let metrics = env("NESTOR_E2E_METRICS", "http://127.0.0.1:19100");
+        let admin = env("NESTOR_E2E_ADMIN", "http://127.0.0.1:19190");
         wait::healthy(
             &format!("{nestor_endpoint}/-/health"),
             Duration::from_secs(60),
         )
         .await;
+        wait::healthy(&format!("{admin}/ready"), Duration::from_secs(60)).await;
         Self {
             origin: s3::client(&rustfs),
             nestor: s3::client(&nestor_endpoint),
             nestor_endpoint,
             metrics,
+            admin: Admin::new(&admin),
         }
     }
 
@@ -284,6 +291,172 @@ async fn delete_and_list_go_through_to_the_origin() {
         Err(Error::NotFound { .. })
     ));
     step!("DELETE invalidated the cache and removed the object at the origin");
+}
+
+#[tokio::test]
+#[ignore = "needs the single compose stack"]
+async fn admin_api_follows_real_traffic_and_agrees_with_metrics() {
+    let stack = Stack::connect().await;
+    assert_eq!(stack.admin.health().await, "ok");
+    let ready = stack.admin.ready().await;
+    assert_eq!(ready["ready"], true);
+    assert_eq!(ready["s3"], "0.0.0.0:9000");
+    assert_eq!(ready["metrics"], "0.0.0.0:9100");
+    step!("admin listener is up and ready");
+
+    let key = "single/admin";
+    let data = payload(3 * MIB + 11, 33);
+    stack
+        .origin
+        .put(&Path::from(key), data.clone().into())
+        .await
+        .expect("put at origin");
+
+    let before = stack.admin.status().await;
+    assert_eq!(
+        before["origin"].as_str().unwrap().trim_end_matches('/'),
+        "http://rustfs:9000"
+    );
+    assert!(before["cache"]["memoryCap"].as_u64().unwrap() > 0);
+    assert!(before["cache"]["diskCap"].as_u64().unwrap() > 0);
+    assert!(before["cache"]["metaCap"].as_u64().unwrap() > 0);
+
+    assert_eq!(stack.read(key).await, data);
+    let after_miss = stack.admin.status().await;
+    assert!(
+        after_miss["totals"]["originRequests"].as_u64().unwrap()
+            > before["totals"]["originRequests"].as_u64().unwrap(),
+        "first read must show up as origin traffic"
+    );
+    assert!(
+        after_miss["totals"]["bytesServed"].as_u64().unwrap()
+            >= before["totals"]["bytesServed"].as_u64().unwrap() + data.len() as u64
+    );
+    step!("miss counted on /admin/status");
+
+    assert_eq!(stack.read(key).await, data);
+    let after_hit = stack.admin.status().await;
+    assert_eq!(
+        after_hit["totals"]["originRequests"],
+        after_miss["totals"]["originRequests"]
+    );
+    assert!(
+        after_hit["totals"]["hits"].as_u64().unwrap()
+            > after_miss["totals"]["hits"].as_u64().unwrap()
+    );
+    assert!(after_hit["hitRatio"].as_f64().unwrap() > 0.0);
+    step!("hit counted on /admin/status");
+
+    let metrics = stack.metrics().await;
+    let admin = stack.admin.status().await;
+    assert_eq!(
+        admin["totals"]["hits"].as_u64().unwrap(),
+        metrics.counter("nestor_blocks_hit_total")
+    );
+    assert_eq!(
+        admin["totals"]["originRequests"].as_u64().unwrap(),
+        metrics.counter("nestor_origin_requests_total")
+    );
+    step!("admin counters agree with /metrics");
+
+    let namespaces = stack.admin.namespaces().await;
+    let bucket = namespaces["namespaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|ns| ns["name"] == BUCKET)
+        .expect("bucket namespace");
+    assert_eq!(bucket["blockSize"], MIB as u64);
+    assert_eq!(bucket["consistency"]["mode"], "etag");
+    assert_eq!(bucket["consistency"]["ttlSeconds"], 1);
+    assert!(bucket["counters"]["hits"].as_u64().unwrap() > 0);
+    assert!(bucket["hitRatio"].as_f64().unwrap() > 0.0);
+    step!("per bucket policy and counters on /admin/namespaces");
+}
+
+#[tokio::test]
+#[ignore = "needs the single compose stack"]
+async fn dashboard_is_embedded_in_the_image() {
+    let stack = Stack::connect().await;
+    let index = stack.admin.page("/").await;
+    assert!(index.status.is_success());
+    assert!(index.content_type.starts_with("text/html"));
+    assert!(index.body.contains("Nestor Admin"));
+    assert!(
+        !index.body.contains("built without the dashboard"),
+        "the image must ship the compiled dashboard"
+    );
+
+    let asset = index
+        .body
+        .split("/assets/")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .expect("index references a built asset");
+    let script = stack.admin.page(&format!("/assets/{asset}")).await;
+    assert!(script.status.is_success());
+    assert!(script.content_type.starts_with("text/javascript"));
+    assert_eq!(script.cache_control, "public, max-age=31536000, immutable");
+    step!(asset, "dashboard bundle served with immutable caching");
+
+    let missing = stack.admin.page("/assets/nope.js").await;
+    assert_eq!(missing.status, reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+#[ignore = "needs the single compose stack"]
+async fn cli_admin_client_runs_inside_the_container() {
+    let stack = Stack::connect().await;
+    let compose = Compose::for_scenario("single");
+    let endpoint = "http://127.0.0.1:9190";
+
+    let status: Value = serde_json::from_str(
+        &compose
+            .exec(
+                "nestor",
+                &[
+                    "nestor",
+                    "admin",
+                    "--admin-endpoint",
+                    endpoint,
+                    "--json",
+                    "status",
+                ],
+            )
+            .await,
+    )
+    .expect("status json");
+    let live = stack.admin.status().await;
+    assert_eq!(status["origin"], live["origin"]);
+    assert_eq!(status["cache"]["memoryCap"], live["cache"]["memoryCap"]);
+    step!("nestor admin status --json matches the API");
+
+    let text = compose
+        .exec(
+            "nestor",
+            &["nestor", "admin", "--admin-endpoint", endpoint, "status"],
+        )
+        .await;
+    assert!(text.contains("origin=http://rustfs:9000"));
+    assert!(text.contains("hitRatio="));
+
+    let namespaces = compose
+        .exec(
+            "nestor",
+            &[
+                "nestor",
+                "admin",
+                "--admin-endpoint",
+                endpoint,
+                "namespaces",
+            ],
+        )
+        .await;
+    assert!(
+        namespaces.contains(&format!("ns={BUCKET} ")) || namespaces.contains("no namespaces"),
+        "unexpected namespaces output: {namespaces}"
+    );
+    step!("nestor admin namespaces renders");
 }
 
 #[tokio::test]

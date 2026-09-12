@@ -88,6 +88,12 @@ fn unix_millis(time: SystemTime) -> u64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NamespaceId(pub(crate) u32);
 
+impl NamespaceId {
+    pub fn as_u32(self) -> u32 {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ObjectKey {
     pub namespace: NamespaceId,

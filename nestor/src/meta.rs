@@ -64,4 +64,12 @@ impl MetaCache {
     pub fn remove(&self, key: &ObjectKey) {
         self.cache.remove(key);
     }
+
+    pub fn usage(&self) -> usize {
+        self.cache.usage()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.cache.capacity()
+    }
 }

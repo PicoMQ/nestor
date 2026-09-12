@@ -1,6 +1,7 @@
 //! Shared pieces for the scenarios: endpoint settings, S3 clients, payloads, metrics scraping,
 //! readiness polling and docker compose control.
 
+pub mod admin;
 pub mod compose;
 pub mod data;
 pub mod metrics;

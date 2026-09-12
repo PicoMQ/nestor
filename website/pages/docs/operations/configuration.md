@@ -18,6 +18,9 @@ The reference file with every default is [`nestor-cli/nestor.toml`](https://gith
 | --- | --- | --- |
 | `listen` | `127.0.0.1:9000` | The S3 listener. |
 | `metrics` | unset | Prometheus listener serving `/metrics`. Unset disables it. |
+| `admin.listen` | `127.0.0.1:9190` | Admin API and dashboard. |
+| `admin.enabled` | `true` | |
+| `admin.insecure_allow_remote` | `false` | Required for a non-loopback admin bind. |
 | `tls` | unset | `{ cert = "...", key = "..." }` in PEM. Terminates TLS on `listen`. |
 | `addressing` | `{ style = "path" }` | Or `{ style = "virtual_hosted", domain = "s3.internal" }` to take the bucket from the `Host` header. |
 

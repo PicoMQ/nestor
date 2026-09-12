@@ -1,9 +1,7 @@
-//! The `nestor` binary. `serve` runs the S3 frontend, `check` validates a configuration.
-
 mod cluster;
 mod config;
+mod query;
 mod serve;
-mod telemetry;
 
 use std::path::PathBuf;
 
@@ -37,6 +35,7 @@ enum Command {
         #[arg(short, long, env = "NESTOR_CONFIG")]
         config: Option<PathBuf>,
     },
+    Admin(query::QueryArgs),
 }
 
 fn main() -> Result<(), Report> {
@@ -60,5 +59,9 @@ fn main() -> Result<(), Report> {
             println!("configuration ok");
             Ok(())
         }
+        Command::Admin(args) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(query::run(args)),
     }
 }

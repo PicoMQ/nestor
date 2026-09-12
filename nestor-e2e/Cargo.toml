@@ -14,7 +14,8 @@ nestor-store = { workspace = true }
 nestor-client = { workspace = true }
 
 object_store = { workspace = true, features = ["aws"] }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+serde_json = { workspace = true }
 
 async-trait = { workspace = true }
 bytes = { workspace = true }

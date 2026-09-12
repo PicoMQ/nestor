@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use nestor_e2e::admin::Admin;
 use nestor_e2e::compose::Compose;
 use nestor_e2e::data::{MIB, body, payload, slice};
 use nestor_e2e::metrics::Metrics;
@@ -19,6 +20,8 @@ struct Stack {
     origin: Arc<AmazonS3>,
     gateway: Arc<AmazonS3>,
     nodes: Vec<String>,
+    gateway_admin: Admin,
+    node_admins: Vec<Admin>,
 }
 
 impl Stack {
@@ -26,6 +29,7 @@ impl Stack {
         init();
         let rustfs = env("NESTOR_E2E_RUSTFS", "http://127.0.0.1:19000");
         let gateway = env("NESTOR_E2E_GATEWAY", "http://127.0.0.1:19001");
+        let gateway_admin = env("NESTOR_E2E_GATEWAY_ADMIN", "http://127.0.0.1:19190");
         let nodes: Vec<String> = (1..=3)
             .map(|i| {
                 env(
@@ -34,12 +38,31 @@ impl Stack {
                 )
             })
             .collect();
+        let node_admins = (1..=3)
+            .map(|i| {
+                Admin::new(&env(
+                    &format!("NESTOR_E2E_NODE{i}_ADMIN"),
+                    &format!("http://127.0.0.1:1919{i}"),
+                ))
+            })
+            .collect();
         wait::healthy(&format!("{gateway}/-/health"), Duration::from_secs(120)).await;
+        wait::healthy(&format!("{gateway_admin}/ready"), Duration::from_secs(60)).await;
         Self {
             origin: s3::client(&rustfs),
             gateway: s3::client(&gateway),
             nodes,
+            gateway_admin: Admin::new(&gateway_admin),
+            node_admins,
         }
+    }
+
+    async fn node_admin_origin_bytes(&self) -> Vec<u64> {
+        let mut bytes = Vec::with_capacity(self.node_admins.len());
+        for admin in &self.node_admins {
+            bytes.push(admin.origin_bytes().await);
+        }
+        bytes
     }
 
     async fn node_origin_bytes(&self) -> Vec<u64> {
@@ -133,6 +156,59 @@ async fn writes_warm_the_owning_nodes() {
 
 #[tokio::test]
 #[ignore = "needs the cluster compose stack"]
+async fn every_node_and_the_gateway_expose_admin_state() {
+    let stack = Stack::connect().await;
+    let key = Path::from("cluster/admin");
+    let data = payload(64 * MIB, 65);
+    stack
+        .origin
+        .put(&key, data.clone().into())
+        .await
+        .expect("put");
+
+    let before = stack.node_admin_origin_bytes().await;
+    let gateway_before = stack.gateway_admin.status().await;
+    assert_eq!(stack.read(&key).await, data);
+    let after = stack.node_admin_origin_bytes().await;
+    let fetched: Vec<u64> = before.iter().zip(&after).map(|(b, a)| a - b).collect();
+    step!(?fetched, "origin bytes per node from /admin/status");
+    assert!(
+        fetched.iter().all(|f| *f > 0),
+        "every node admin should report origin traffic for its blocks"
+    );
+    assert_eq!(
+        fetched.iter().sum::<u64>(),
+        (64 * MIB) as u64,
+        "node admins should account for every origin byte exactly once"
+    );
+
+    for (i, admin) in stack.node_admins.iter().enumerate() {
+        let metrics = Metrics::scrape(&stack.nodes[i]).await;
+        assert_eq!(
+            admin.origin_bytes().await,
+            metrics.counter(ORIGIN_BYTES),
+            "node{} admin disagrees with its metrics",
+            i + 1
+        );
+        let namespaces = admin.namespaces().await;
+        let ns = &namespaces["namespaces"][0];
+        assert_eq!(ns["consistency"]["mode"], "immutable");
+        assert_eq!(ns["readahead"], 0);
+    }
+    step!("node admin counters agree with node metrics");
+
+    let gateway_after = stack.gateway_admin.status().await;
+    assert!(
+        gateway_after["totals"]["bytesServed"].as_u64().unwrap()
+            >= gateway_before["totals"]["bytesServed"].as_u64().unwrap() + (64 * MIB) as u64
+    );
+    let ready = stack.gateway_admin.ready().await;
+    assert_eq!(ready["ready"], true);
+    step!("gateway admin reports served bytes and readiness");
+}
+
+#[tokio::test]
+#[ignore = "needs the cluster compose stack"]
 async fn a_stopped_node_is_routed_around_and_rejoins() {
     let stack = Stack::connect().await;
     let compose = Compose::for_scenario("cluster");
@@ -164,6 +240,7 @@ async fn a_stopped_node_is_routed_around_and_rejoins() {
         Duration::from_secs(60),
     )
     .await;
+    assert_eq!(stack.node_admins[1].ready().await["ready"], true);
     step!("node2 back, waiting for the gateway to pick it up");
     let node2_before = stack.node_origin_bytes().await[1];
     wait::until(

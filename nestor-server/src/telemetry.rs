@@ -34,6 +34,11 @@ impl Telemetry {
         Box::new(PrometheusMetricsRegistry::new(self.foyer.clone()))
     }
 
+    pub fn render_nestor(&self) -> String {
+        self.nestor.run_upkeep();
+        self.nestor.render()
+    }
+
     pub async fn serve(self, addr: SocketAddr) -> Result<(), Report> {
         let router = Router::new()
             .route("/metrics", get(render))
