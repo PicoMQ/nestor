@@ -1112,3 +1112,34 @@ async fn an_invalidated_object_stays_gone_after_a_restart() {
         assert_eq!(kept, [false], "{admission:?}");
     }
 }
+
+#[tokio::test]
+async fn a_restart_serves_a_whole_object_read_from_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = stored(&["obj"]);
+    let (nestor, id) = hybrid(
+        disk(dir.path(), DiskAdmission::Fetched),
+        namespace(origin, Consistency::Immutable),
+    )
+    .await;
+    let data = nestor.read(id, "obj", 0..OBJECT).await.unwrap();
+    nestor.close().await.unwrap();
+
+    let offline = Arc::new(MemoryOrigin::new());
+    offline.fail_next(usize::MAX);
+    let (nestor, id) = hybrid(
+        disk(dir.path(), DiskAdmission::Fetched),
+        namespace(offline.clone(), Consistency::Immutable),
+    )
+    .await;
+
+    let whole = nestor.get(id, "obj", ReadRange::Full).await.unwrap();
+    assert_eq!(whole.collect().await.unwrap(), data);
+    let suffix = nestor.get(id, "obj", ReadRange::Suffix(10)).await.unwrap();
+    assert_eq!(
+        suffix.collect().await.unwrap(),
+        data.slice(data.len() - 10..)
+    );
+    assert_eq!(offline.gets() + offline.heads(), 0);
+    nestor.close().await.unwrap();
+}

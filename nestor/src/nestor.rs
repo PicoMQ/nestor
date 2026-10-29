@@ -68,14 +68,25 @@ impl Engine {
             MetaLookup::Stale(meta) => Some(meta),
             MetaLookup::Missing => None,
         };
-        if ns.config.consistency.is_immutable() && !request.needs_size() {
-            return Ok(ReadCtx::new(
-                Arc::clone(ns),
-                key,
-                Arc::clone(name),
-                None,
-                policy,
-            ));
+        if ns.config.consistency.is_immutable() {
+            if !request.needs_size() {
+                return Ok(ReadCtx::new(
+                    Arc::clone(ns),
+                    key,
+                    Arc::clone(name),
+                    None,
+                    policy,
+                ));
+            }
+            if let Some(meta) = self.cached_meta(ns, &key, request).await {
+                return Ok(ReadCtx::new(
+                    Arc::clone(ns),
+                    key,
+                    Arc::clone(name),
+                    Some(meta),
+                    policy,
+                ));
+            }
         }
         let window = ns.config.fetch_window;
         if let Some(indexes) = ns.config.block_size.first_group(request, window) {
@@ -89,6 +100,27 @@ impl Engine {
             Some(meta),
             policy,
         ))
+    }
+
+    async fn cached_meta(
+        &self,
+        ns: &NamespaceState,
+        key: &ObjectKey,
+        request: &ReadRange,
+    ) -> Option<ObjectMeta> {
+        let index = ns
+            .config
+            .block_size
+            .first_group(request, 1)
+            .map_or(0, |group| group.start);
+        let block = self
+            .fetcher
+            .blocks
+            .get(&BlockKey::new(key, IMMUTABLE_TAG, index))
+            .await?;
+
+        self.meta.put(key.clone(), block.meta.clone());
+        Some(block.meta)
     }
 }
 

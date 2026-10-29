@@ -35,7 +35,7 @@ A read needs the object's size and `ETag` before it can resolve open ranges or t
 </svg>
 </div>
 
-The probe requests the blocks the read would fetch first anyway. The `Content-Range` total gives the size, the `ETag` header gives the tag, and the body is consumed as a normal fetch group so nothing is thrown away. If the metadata cache had an expired entry, the probe carries `If-None-Match` and a `304` refreshes the entry for free. Bounded reads in immutable namespaces skip the probe entirely because they need neither the size nor a tag.
+The probe requests the blocks the read would fetch first anyway. The `Content-Range` total gives the size, the `ETag` header gives the tag, and the body is consumed as a normal fetch group so nothing is thrown away. If the metadata cache had an expired entry, the probe carries `If-None-Match` and a `304` refreshes the entry for free. Bounded reads in immutable namespaces skip the probe entirely because they need neither the size nor a tag. Other reads in immutable namespaces take the size from a cached block of the object when there is one, so a restart serves them from disk.
 
 The only read that still pays a `HEAD` is a suffix range on an object of unknown size, since its first block cannot be computed without the total.
 
