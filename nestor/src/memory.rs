@@ -1,5 +1,5 @@
 //! In-memory `Origin` for tests. Latency, slow responses, body stalls and failures can be injected
-//! per call.
+//! per call, and every ranged get can be answered with the whole object.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -33,6 +33,7 @@ pub struct MemoryOrigin {
     objects: RwLock<HashMap<String, StoredObject>>,
     stats: OriginStats,
     chunk: usize,
+    whole: bool,
     latency: Mutex<Duration>,
     slow: Mutex<Option<(usize, Duration)>>,
     stall: Mutex<Option<(usize, Duration)>>,
@@ -53,6 +54,7 @@ impl MemoryOrigin {
             objects: RwLock::new(HashMap::new()),
             stats: OriginStats::default(),
             chunk: 64 * 1024,
+            whole: false,
             latency: Mutex::new(Duration::ZERO),
             slow: Mutex::new(None),
             stall: Mutex::new(None),
@@ -64,6 +66,11 @@ impl MemoryOrigin {
 
     pub fn with_chunk(mut self, chunk: usize) -> Self {
         self.chunk = chunk.max(1);
+        self
+    }
+
+    pub fn with_whole_objects(mut self) -> Self {
+        self.whole = true;
         self
     }
 
@@ -200,7 +207,10 @@ impl Origin for MemoryOrigin {
             return Err(OriginError::NotModified);
         }
         let meta = meta_of(&stored);
-        let range = resolve(options.range, meta.size)?;
+        let mut range = resolve(options.range, meta.size)?;
+        if self.whole {
+            range = 0..meta.size;
+        }
         let body = stored.body.slice(range.start as usize..range.end as usize);
         self.stats
             .bytes

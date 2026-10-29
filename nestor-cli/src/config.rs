@@ -11,8 +11,8 @@ use figment::Figment;
 use figment::providers::{Env, Format, Toml};
 use http::Uri;
 use nestor::{
-    BlockSize, CacheConfig, Compression, Consistency, DiskConfig, DiskIo, FetchPolicy, HedgeConfig,
-    NamespaceConfig, NestorBuilder, RecoverMode,
+    BlockSize, CacheConfig, Compression, Consistency, DiskAdmission, DiskConfig, DiskIo,
+    FetchPolicy, HedgeConfig, NamespaceConfig, NestorBuilder, RecoverMode,
 };
 use nestor_client::{ClusterConfig, Credentials, Membership};
 use nestor_s3::{Addressing, Auth, OriginConfig, S3Config};
@@ -292,6 +292,7 @@ impl Cache {
 pub struct Disk {
     pub path: PathBuf,
     pub capacity: Byte,
+    pub admission: DiskAdmission,
     pub region_size: Byte,
     pub direct_io: bool,
     pub compression: DiskCompression,
@@ -306,6 +307,7 @@ impl Default for Disk {
         Self {
             path: defaults.path,
             capacity: Byte::from_u64(defaults.capacity as u64),
+            admission: defaults.admission,
             region_size: Byte::from_u64(defaults.region_size as u64),
             direct_io: defaults.direct_io,
             compression: DiskCompression::None,
@@ -319,6 +321,7 @@ impl Default for Disk {
 impl Disk {
     fn build(&self) -> Result<DiskConfig, Report> {
         let mut config = DiskConfig::new(&self.path, bytes(self.capacity, "cache.disk.capacity")?);
+        config.admission = self.admission;
         config.region_size = bytes(self.region_size, "cache.disk.region_size")?;
         config.direct_io = self.direct_io;
         config.compression = self.compression.into();
@@ -633,6 +636,7 @@ mod tests {
                 r#"
                 [cache.disk]
                 path = "/var/lib/nestor"
+                admission = "reused"
                 io = "psync"
                 runtime_threads = 8
 
@@ -642,6 +646,7 @@ mod tests {
             )?;
             let config = Config::load(Some(Path::new("nestor.toml"))).unwrap();
             let disk = config.cache.disk.as_ref().unwrap().build().unwrap();
+            assert_eq!(disk.admission, DiskAdmission::Reused);
             assert_eq!(disk.io, DiskIo::Psync);
             assert_eq!(disk.runtime_threads(), 8);
             assert_eq!(

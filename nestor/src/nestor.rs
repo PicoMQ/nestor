@@ -10,7 +10,7 @@ use bytes::Bytes;
 use mixtrics::metrics::BoxedRegistry;
 
 use crate::block::ReadRange;
-use crate::cache::{self, CacheConfig};
+use crate::cache::{Blocks, CacheConfig};
 use crate::error::{NestorError, Result};
 use crate::fetch::{Fetcher, Priority, ReadCtx};
 use crate::key::{Block, BlockKey, IMMUTABLE_TAG, NamespaceId, ObjectKey, block_tag};
@@ -194,10 +194,16 @@ impl NestorBuilder {
     }
 
     pub async fn build(self) -> Result<Nestor> {
-        let cache = cache::build(&self.cache, self.metrics).await?;
+        let smallest = self
+            .namespaces
+            .iter()
+            .map(|ns| ns.config.block_size)
+            .min_by_key(|block_size| block_size.bytes())
+            .unwrap_or_default();
+        let blocks = Blocks::open(&self.cache, self.metrics, smallest).await?;
         let meta = Arc::new(MetaCache::new(self.meta_capacity));
         let fetcher = Fetcher::new(
-            cache,
+            blocks,
             Arc::clone(&meta),
             self.origin_concurrency,
             self.readahead_concurrency,
@@ -234,6 +240,10 @@ impl Nestor {
             return *id;
         }
         let id = NamespaceId(registry.states.len() as u32);
+        self.engine
+            .fetcher
+            .blocks
+            .track(namespace.config.block_size);
         registry.by_name.insert(Arc::clone(&namespace.name), id);
         registry
             .states
@@ -265,13 +275,12 @@ impl Nestor {
             .registry
             .read()
             .unwrap_or_else(|e| e.into_inner());
-        let cache = &self.engine.fetcher.cache;
-        let memory = cache.memory();
+        let blocks = &self.engine.fetcher.blocks;
         NodeSnapshot {
             cache: CacheSnapshot {
-                memory_used: memory.usage(),
-                memory_cap: memory.capacity(),
-                disk_cap: self.engine.disk_cap.filter(|_| cache.is_hybrid()),
+                memory_used: blocks.memory_usage(),
+                memory_cap: blocks.memory_capacity(),
+                disk_cap: self.engine.disk_cap.filter(|_| blocks.has_disk()),
                 meta_used: self.engine.meta.usage(),
                 meta_cap: self.engine.meta.capacity(),
                 inflight: self.engine.fetcher.inflight(),
@@ -389,11 +398,11 @@ impl Nestor {
         let key = ObjectKey::new(ns, object);
         let tag = block_tag(state.config.consistency, &meta);
         let bs = state.config.block_size;
-        let cache = &self.engine.fetcher.cache;
+        let blocks = &self.engine.fetcher.blocks;
         for index in 0..bs.count(meta.size) {
             let range = bs.block_range(index, Some(meta.size));
             let block = data.slice(range.start as usize..range.end as usize);
-            cache.insert(
+            blocks.insert(
                 BlockKey::new(&key, tag, index),
                 Block::new(meta.clone(), block),
             );
@@ -413,7 +422,7 @@ impl Nestor {
             for index in 0..bs.count(meta.size) {
                 self.engine
                     .fetcher
-                    .cache
+                    .blocks
                     .remove(&BlockKey::new(&key, IMMUTABLE_TAG, index));
             }
         }
@@ -425,7 +434,7 @@ impl Nestor {
         if self.engine.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        self.engine.fetcher.cache.close().await?;
+        self.engine.fetcher.blocks.close().await?;
         Ok(())
     }
 }

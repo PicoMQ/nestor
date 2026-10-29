@@ -17,6 +17,8 @@ Every series carries a `namespace` label. In the S3 endpoint that is the bucket 
 | `nestor_blocks_miss_total` | counter | Blocks this read had to fetch. |
 | `nestor_blocks_joined_total` | counter | Blocks this read waited on because another read was already fetching them. |
 | `nestor_blocks_stale_total` | counter | Fetches abandoned because the object changed mid-read. |
+| `nestor_blocks_reused_total` | counter | Blocks written to disk at their second read, under `admission = "reused"`. |
+| `nestor_blocks_extra_total` | counter | Blocks cached from an origin response beyond the range asked for. |
 | `nestor_origin_requests_total` | counter | `GET`s to the origin, hedges excluded. |
 | `nestor_origin_bytes_total` | counter | Bytes received from the origin. |
 | `nestor_origin_errors_total` | counter | Origin `GET`s that failed, before retry. |

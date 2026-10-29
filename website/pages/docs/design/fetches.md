@@ -128,6 +128,19 @@ A `GET` that fails while the object's size is unknown may have asked past the en
 
 Out of attempts fails the waiting readers with the last error, out of deadline fails them with a timeout. A short read is a body that ended before the requested range did.
 
+## Wider responses
+
+An origin may answer a ranged `GET` with a wider range, up to the whole object. The range starts on a block boundary at or before the requested start and covers the request. Any other range is a short read.
+
+- Blocks before and after the request that are not cached or in flight are registered as in flight, so a read of one of them waits for this response.
+- Blocks before the request are cached as the body is read.
+- Requested blocks go to their readers as with any response.
+- Blocks after the request are cached from the same stream once every reader is answered. They are not hedged or retried, and an error while reading them fails no read.
+- A read waiting on a block the response did not deliver fetches the block itself, once.
+- A partial block at the end is dropped, unless it is the object's last block.
+- A hedge backup may be wider too. Its bytes before the owed block are skipped.
+- The attempt deadline covers every block up to the last requested one, including the blocks before the request.
+
 ## Readahead
 
 A read that starts where the previous read of the same object ended is sequential. When a namespace has `readahead` set, such a read schedules the next `readahead` blocks past its own range as background fetch groups, bounded by the object size. Blocks already cached or in flight are skipped, so readahead costs nothing on a warm object.

@@ -81,4 +81,4 @@ Origin request rate is bounded by `cache.origin_concurrency` per process, `64` b
 
 ## Shutdown
 
-`SIGTERM` or `SIGINT` stops accepting connections, drains in-flight requests for up to `30` s, then flushes the disk tier and exits. A `terminationGracePeriodSeconds` of `45` leaves room for that. Killing the process without a drain loses only what was in the write buffer, the disk tier recovers the rest on the next start.
+`SIGTERM` or `SIGINT` stops accepting connections, drains in-flight requests for up to `30` s, then flushes the disk tier and exits. A `terminationGracePeriodSeconds` of `45` leaves room for that. Killing the process without a drain loses what was in the write buffer, and under `admission = "evicted"` the blocks only in RAM. The disk tier recovers the rest on the next start.

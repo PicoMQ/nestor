@@ -14,6 +14,7 @@ use crate::block::{ReadRange, aligned_take};
 use crate::error::{NestorError, Result};
 use crate::fetch::{Priority, ReadCtx};
 use crate::inflight::SlotHandle;
+use crate::key::BlockKey;
 use crate::nestor::Engine;
 use crate::origin::ObjectMeta;
 
@@ -112,6 +113,7 @@ pub(crate) struct Reader {
     emit: u32,
     window: VecDeque<SlotHandle>,
     restarted: bool,
+    refetched: Option<u32>,
     done: bool,
 }
 
@@ -139,6 +141,7 @@ impl Reader {
             emit: blocks.start,
             window: VecDeque::new(),
             restarted: false,
+            refetched: None,
             done: false,
         }
     }
@@ -241,11 +244,10 @@ impl Reader {
             self.emit += 1;
             match handle.wait().await {
                 Ok(block) => {
-                    self.learn(Some(block.meta));
-                    let block = block.data;
+                    self.learn(Some(block.meta.clone()));
                     let bs = self.ctx.namespace.config.block_size;
                     let within = bs.slice_within(index, &self.range);
-                    if block.is_empty() || within.start >= block.len() {
+                    if block.data.is_empty() || within.start >= block.data.len() {
                         self.done = true;
                         if index == self.first {
                             let size = self.size().unwrap_or(0);
@@ -253,6 +255,12 @@ impl Reader {
                         }
                         return None;
                     }
+                    let key = BlockKey::new(&self.ctx.key, self.ctx.tag, index);
+                    let written = self.engine.fetcher.blocks.record_read(&key, &block);
+                    if written {
+                        self.ctx.namespace.metrics.reused.increment(1);
+                    }
+                    let block = block.data;
                     let end = within.end.min(block.len());
                     let out = block.slice(within.start..end);
                     if block.len() < bs.usize() || index + 1 >= self.end {
@@ -264,6 +272,18 @@ impl Reader {
                         .bytes_served
                         .increment(out.len() as u64);
                     return Some(Ok(out));
+                }
+                Err(e) if e.is_cancelled() && self.refetched != Some(index) => {
+                    self.refetched = Some(index);
+                    self.emit = index;
+                    let handles = self
+                        .engine
+                        .fetcher
+                        .schedule(&self.ctx, index..index + 1, Priority::Foreground)
+                        .await;
+                    for handle in handles.into_iter().rev() {
+                        self.window.push_front(handle);
+                    }
                 }
                 Err(e) if e.is_stale() && !self.restarted && index == self.first => {
                     if let Err(e) = self.restart().await {

@@ -70,6 +70,7 @@ Absent by default. Present enables the disk tier.
 | --- | --- | --- |
 | `path` | `/var/lib/nestor` | Directory foyer owns. Must be writable, existing regions are recovered. |
 | `capacity` | `8 GiB` | Disk tier size. |
+| `admission` | `fetched` | `fetched`, `evicted` or `reused`, see [Cache tiers](/docs/design/tiers#admission). |
 | `region_size` | `64 MiB` | Append and reclaim unit. |
 | `direct_io` | `true` | `O_DIRECT` on Linux. Ignored elsewhere. |
 | `compression` | `none` | `lz4` or `zstd`. |

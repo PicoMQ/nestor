@@ -1,9 +1,9 @@
 # Cache tiers
 
-Blocks live in a hybrid cache built on [foyer](https://github.com/foyer-rs/foyer): a sharded RAM tier and an optional disk tier that share one key space. A lookup checks RAM, then disk. An insert goes to RAM and, when disk is configured, is written through to disk in the same step.
+Blocks live in a hybrid cache built on [foyer](https://github.com/foyer-rs/foyer): a sharded RAM tier and an optional disk tier that share one key space. A lookup checks RAM, then disk. An insert goes to RAM, and the disk [admission](#admission) sets which blocks also go to disk and when.
 
 <div class="kakapo-diagram">
-<svg viewBox="0 0 720 250" width="720" role="img" aria-label="A block lookup checks RAM shards then the disk regions. Inserts write to RAM and through to disk when configured.">
+<svg viewBox="0 0 720 250" width="720" role="img" aria-label="A block lookup checks RAM shards then the disk regions. Inserts write to RAM, and to disk as the admission allows.">
   <defs>
     <marker id="arrt" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M0 0.5 L7.5 4 L0 7.5 Z" class="arrow"/>
@@ -51,16 +51,36 @@ Disk is optional. Without it, RAM is the only tier and a block that falls out of
 | --- | --- | --- |
 | `path` | | Directory foyer manages. Existing content is recovered on start. |
 | `capacity` | | Bytes on disk. Filled before anything is reclaimed. |
+| `admission` | `fetched` | Which blocks go to disk, see [Admission](#admission). |
 | `region_size` | `64 MiB` | Append unit and reclaim unit. Larger regions mean fewer, larger sequential writes. |
 | `direct_io` | `true` | Bypass the page cache on Linux so RAM stays available for the RAM tier. |
 | `compression` | `none` | `lz4` or `zstd` per block. Worth it for text, not for already compressed data. |
 | `recover` | `quiet` | `none` starts empty, `quiet` recovers what it can, `strict` fails on any corruption. |
 
-The disk is written as a log of regions. A block is appended to the current region, regions are reclaimed FIFO when capacity is reached, and blocks within a reclaimed region are gone. There is no read-modify-write, so write amplification is one and a consumer-grade SSD lasts.
+The disk is written as a log of regions. A block is appended to the current region, regions are reclaimed FIFO when capacity is reached, and blocks within a reclaimed region are gone. There is no read-modify-write, so write amplification is one under `fetched` and `reused` and a consumer-grade SSD lasts. Under `evicted`, a block read from a region close to reclaim is written again when RAM evicts it.
 
-Inserts are written to disk at insertion time rather than on eviction from RAM. With this policy a block is durable on disk as soon as the origin has delivered it, so a restart shortly after warming does not lose the warm set, and RAM eviction never causes a burst of disk writes. Writes are buffered in a pool shared by the flushers, sized from capacity and clamped to `[flushers * region_size, 256 MiB]`.
+Writes are buffered in a pool shared by the flushers, sized from capacity and clamped to `[flushers * region_size, 256 MiB]`.
 
 Disk I/O uses `io_uring` on Linux when `cache.disk.io` is `auto` or `uring`, and `psync` otherwise. `auto` probes a ring of depth 64, matching foyer, and falls back where the syscall is blocked, such as Docker's default seccomp profile. Disk work runs on a dedicated Tokio runtime so `pread`/`pwrite` in the psync engine do not share the S3 worker pool.
+
+### Admission
+
+| `admission` | Written to disk |
+| --- | --- |
+| `fetched` | Every block, when it is fetched or inserted. A restart keeps every block that has arrived, and RAM eviction causes no disk writes. |
+| `evicted` | Every block, when RAM evicts it. |
+| `reused` | A block read twice, written at its second read. A block read once, such as one pass over a large object, never goes to disk. |
+
+Under `reused`:
+
+- A read is a block delivered to a caller, from RAM, from its own fetch or from another read's fetch. Lookups, readahead and blocks cached from a [wider response](/docs/design/fetches#wider-responses) are not reads.
+- The read that brings a block's count to two writes it to disk, if RAM still holds that block.
+- Counts are kept for twice as many blocks as RAM holds at the smallest block size of any namespace, at about 107 bytes each. For 1 GiB of RAM and 1 MiB blocks that is 2,048 counts in about 214 KiB. Older counts are dropped.
+- A block found on disk counts as read twice, so it is not written again.
+- `invalidate` drops the counts of the object's blocks.
+- RAM eviction and `close` write nothing.
+
+Under `evicted`, `close` writes the blocks in RAM to disk.
 
 ## Restart
 
