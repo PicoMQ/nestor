@@ -124,6 +124,7 @@ impl Reader {
         request: ReadRange,
         ctx: Arc<ReadCtx>,
         range: Range<u64>,
+        fetched: Vec<SlotHandle>,
     ) -> Self {
         let blocks = ctx.namespace.config.block_size.blocks(&range);
         let known = Arc::new(OnceLock::new());
@@ -137,10 +138,10 @@ impl Reader {
             ctx,
             range,
             first: blocks.start,
-            next: blocks.start,
+            next: blocks.start + fetched.len() as u32,
             end: blocks.end,
             emit: blocks.start,
-            window: VecDeque::new(),
+            window: VecDeque::from(fetched),
             restarted: false,
             refetched: None,
             done: false,
@@ -210,7 +211,7 @@ impl Reader {
     async fn restart(&mut self) -> Result<()> {
         self.restarted = true;
         self.window.clear();
-        let ctx = self
+        let (ctx, fetched) = self
             .engine
             .resolve_ctx(
                 &self.ctx.namespace,
@@ -225,9 +226,10 @@ impl Reader {
         self.ctx = ctx;
         self.known = Arc::new(OnceLock::from(meta));
         self.first = blocks.start;
-        self.next = blocks.start;
+        self.next = blocks.start + fetched.len() as u32;
         self.end = blocks.end;
         self.emit = blocks.start;
+        self.window = VecDeque::from(fetched);
         Ok(())
     }
 

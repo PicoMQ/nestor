@@ -216,7 +216,7 @@ impl Fetcher {
         indexes: Range<u32>,
         stale: Option<ObjectMeta>,
         policy: FetchPolicy,
-    ) -> Result<Arc<ReadCtx>, NestorError> {
+    ) -> Result<(Arc<ReadCtx>, Vec<SlotHandle>), NestorError> {
         let key = ObjectKey::new(ns.id, name);
         let ctx = ReadCtx::new(Arc::clone(ns), key.clone(), Arc::clone(name), None, policy);
         let bs = ns.config.block_size;
@@ -241,12 +241,12 @@ impl Fetcher {
             match self.origin_get(&ctx, options.clone(), deadline).await {
                 Ok(response) => {
                     let ctx = build(response.meta.clone());
-                    self.adopt(&ctx, indexes, response);
-                    return Ok(ctx);
+                    let fetched = self.adopt(&ctx, indexes, response);
+                    return Ok((ctx, fetched));
                 }
                 Err(OriginError::NotModified) => {
                     let meta = stale.ok_or(NestorError::Origin(OriginError::NotModified))?;
-                    return Ok(build(meta));
+                    return Ok((build(meta), Vec::new()));
                 }
                 Err(OriginError::NotFound) => {
                     self.meta.remove(&key);
@@ -256,7 +256,7 @@ impl Fetcher {
                     ns.metrics.origin_errors.increment(1);
                     let start = bs.offset(indexes.start);
                     if let Some(meta) = self.past_end(ns, &key, name, start).await {
-                        return Ok(build(meta));
+                        return Ok((build(meta), Vec::new()));
                     }
                     retry.failed(e).await?;
                     ns.metrics.origin_retries.increment(1);
@@ -276,21 +276,28 @@ impl Fetcher {
         (start >= meta.size).then_some(meta)
     }
 
-    fn adopt(self: &Arc<Self>, ctx: &Arc<ReadCtx>, indexes: Range<u32>, response: GetResponse) {
+    fn adopt(
+        self: &Arc<Self>,
+        ctx: &Arc<ReadCtx>,
+        indexes: Range<u32>,
+        response: GetResponse,
+    ) -> Vec<SlotHandle> {
         let end = indexes
             .end
             .min(ctx.namespace.config.block_size.count(response.meta.size));
-        let slots: VecDeque<Slot> = (indexes.start..end)
+        let (slots, fetched): (VecDeque<Slot>, Vec<SlotHandle>) = (indexes.start..end)
             .map_while(|index| {
                 match self
                     .inflight
                     .register(BlockKey::new(&ctx.key, ctx.tag, index))
                 {
-                    Registration::Owner(slot, _) => Some(slot),
+                    Registration::Owner(slot, handle) => Some((slot, handle)),
                     Registration::Waiter(_) => None,
                 }
             })
-            .collect();
+            .unzip();
+
+        ctx.namespace.metrics.misses.increment(slots.len() as u64);
         if !slots.is_empty() {
             tokio::spawn(Arc::clone(self).fetch_group(
                 Arc::clone(ctx),
@@ -299,6 +306,7 @@ impl Fetcher {
                 Some(response),
             ));
         }
+        fetched
     }
 
     async fn fetch_group(

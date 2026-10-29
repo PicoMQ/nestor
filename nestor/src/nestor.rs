@@ -13,6 +13,7 @@ use crate::block::ReadRange;
 use crate::cache::{Blocks, CacheConfig};
 use crate::error::{NestorError, Result};
 use crate::fetch::{Fetcher, Priority, ReadCtx};
+use crate::inflight::SlotHandle;
 use crate::key::{Block, BlockKey, IMMUTABLE_TAG, NamespaceId, ObjectKey, block_tag};
 use crate::meta::{MetaCache, MetaLookup};
 use crate::namespace::{Namespace, NamespaceState};
@@ -53,39 +54,24 @@ impl Engine {
         name: &Arc<str>,
         request: &ReadRange,
         policy: FetchPolicy,
-    ) -> Result<Arc<ReadCtx>> {
+    ) -> Result<(Arc<ReadCtx>, Vec<SlotHandle>)> {
         let key = ObjectKey::new(ns.id, name);
         let stale = match self.meta.lookup(&key, ns.meta_ttl()) {
             MetaLookup::Fresh(meta) => {
-                return Ok(ReadCtx::new(
-                    Arc::clone(ns),
-                    key,
-                    Arc::clone(name),
-                    Some(meta),
-                    policy,
-                ));
+                let ctx = ReadCtx::new(Arc::clone(ns), key, Arc::clone(name), Some(meta), policy);
+                return Ok((ctx, Vec::new()));
             }
             MetaLookup::Stale(meta) => Some(meta),
             MetaLookup::Missing => None,
         };
         if ns.config.consistency.is_immutable() {
             if !request.needs_size() {
-                return Ok(ReadCtx::new(
-                    Arc::clone(ns),
-                    key,
-                    Arc::clone(name),
-                    None,
-                    policy,
-                ));
+                let ctx = ReadCtx::new(Arc::clone(ns), key, Arc::clone(name), None, policy);
+                return Ok((ctx, Vec::new()));
             }
             if let Some(meta) = self.cached_meta(ns, &key, request).await {
-                return Ok(ReadCtx::new(
-                    Arc::clone(ns),
-                    key,
-                    Arc::clone(name),
-                    Some(meta),
-                    policy,
-                ));
+                let ctx = ReadCtx::new(Arc::clone(ns), key, Arc::clone(name), Some(meta), policy);
+                return Ok((ctx, Vec::new()));
             }
         }
         let window = ns.config.fetch_window;
@@ -93,13 +79,8 @@ impl Engine {
             return self.fetcher.probe(ns, name, indexes, stale, policy).await;
         }
         let meta = self.fetcher.head(ns, &key, name).await?;
-        Ok(ReadCtx::new(
-            Arc::clone(ns),
-            key,
-            Arc::clone(name),
-            Some(meta),
-            policy,
-        ))
+        let ctx = ReadCtx::new(Arc::clone(ns), key, Arc::clone(name), Some(meta), policy);
+        Ok((ctx, Vec::new()))
     }
 
     async fn cached_meta(
@@ -367,7 +348,7 @@ impl Nestor {
         } = options;
         let policy = state.config.fetch.with(&fetch);
         let name: Arc<str> = Arc::from(object);
-        let ctx = self
+        let (ctx, fetched) = self
             .engine
             .resolve_ctx(&state, &name, &request, policy)
             .await?;
@@ -386,7 +367,7 @@ impl Nestor {
             self.spawn_readahead(&state, &ctx, &range);
         }
 
-        Ok(Reader::new(Arc::clone(&self.engine), request, ctx, range).into_stream())
+        Ok(Reader::new(Arc::clone(&self.engine), request, ctx, range, fetched).into_stream())
     }
 
     fn spawn_readahead(&self, state: &NamespaceState, ctx: &Arc<ReadCtx>, range: &Range<u64>) {
