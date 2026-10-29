@@ -1,5 +1,5 @@
 //! In-memory `Origin` for tests. Latency, slow responses, body stalls and failures can be injected
-//! per call, and every ranged get can be answered with the whole object.
+//! per call.
 
 use std::collections::HashMap;
 use std::ops::Range;

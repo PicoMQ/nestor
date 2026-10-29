@@ -1,8 +1,5 @@
-//! Foyer setup. `CacheConfig` describes the RAM tier and optional disk tier for blocks. `Blocks`
-//! owns the hybrid cache and its disk admission. Under `DiskAdmission::Reused` it counts the reads
-//! delivered for each block in a bounded history, writes a block to disk at its second read, and
-//! foyer's admission filter keeps every other block off disk. `lru` builds the small in-memory LRUs
-//! used for bookkeeping: object metadata, readahead positions and read counts.
+//! Foyer setup. `CacheConfig` describes the RAM tier and optional disk tier for blocks,
+//! `lru` is the small in-memory LRU used for bookkeeping.
 
 use std::hash::Hash;
 use std::path::PathBuf;

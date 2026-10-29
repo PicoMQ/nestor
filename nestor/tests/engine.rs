@@ -1,5 +1,5 @@
-//! Engine behaviour against `MemoryOrigin` and a fixed-range origin: hits, misses, coalescing,
-//! hedging, readahead, consistency, invalidation, wider origin responses and disk admission.
+//! Engine behaviour against `MemoryOrigin`: hits, misses, coalescing, hedging, readahead,
+//! consistency and invalidation.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
