@@ -1,7 +1,7 @@
 //! The body of an origin attempt cut into blocks. `BlockStream` buffers chunks until a whole block
 //! is available. `HedgedBody` races the primary stream against a backup request for the range still
 //! owed when a block takes longer than the namespace's hedge delay, and the first stream to complete
-//! the next block carries on.
+//! the next block carries on. A wider backup skips to the owed block.
 
 use std::time::{Duration, Instant};
 

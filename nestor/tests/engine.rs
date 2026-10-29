@@ -1,5 +1,5 @@
 //! Engine behaviour against `MemoryOrigin`: hits, misses, coalescing, hedging, readahead,
-//! consistency and invalidation.
+//! consistency, invalidation, wider responses and disk admission.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

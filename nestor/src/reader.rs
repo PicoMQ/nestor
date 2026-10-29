@@ -1,5 +1,6 @@
 //! Streaming reads. `Reader` walks the blocks covering a range with a bounded window in flight and
-//! slices each block to the requested bytes. `ReadStream` is the public handle.
+//! slices each block to the requested bytes, counting each block read for disk admission.
+//! `ReadStream` is the public handle.
 
 use std::collections::VecDeque;
 use std::ops::Range;

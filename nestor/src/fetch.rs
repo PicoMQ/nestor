@@ -1,4 +1,5 @@
 //! Origin fetch scheduling: grouped, deduplicated, bounded and driven by the read's `FetchPolicy`.
+//! Every whole block of a wider response is cached.
 
 use std::collections::VecDeque;
 use std::ops::Range;

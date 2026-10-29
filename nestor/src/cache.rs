@@ -1,5 +1,5 @@
-//! Foyer setup. `CacheConfig` describes the RAM tier and optional disk tier for blocks,
-//! `lru` is the small in-memory LRU used for bookkeeping.
+//! Foyer setup. `CacheConfig` describes the RAM tier and optional disk tier for blocks, `Blocks`
+//! applies the disk admission, `lru` is the small in-memory LRU used for bookkeeping.
 
 use std::hash::Hash;
 use std::path::PathBuf;
