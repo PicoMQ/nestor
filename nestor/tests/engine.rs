@@ -1143,3 +1143,25 @@ async fn a_restart_serves_a_whole_object_read_from_disk() {
     assert_eq!(offline.gets() + offline.heads(), 0);
     nestor.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_block_written_at_its_second_read_stays_in_ram() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = stored(&["obj"]);
+    let (nestor, id) = hybrid(
+        disk(dir.path(), DiskAdmission::Reused),
+        namespace(origin.clone(), Consistency::Immutable),
+    )
+    .await;
+
+    nestor.read(id, "obj", 0..OBJECT).await.unwrap();
+    let once = nestor.snapshot().cache.memory_used;
+    nestor.read(id, "obj", 0..OBJECT).await.unwrap();
+
+    assert!(once > 0);
+    assert_eq!(nestor.snapshot().cache.memory_used, once);
+    nestor.close().await.unwrap();
+
+    let kept = kept_on_disk(disk(dir.path(), DiskAdmission::Reused), &["obj"]).await;
+    assert_eq!(kept, [true]);
+}

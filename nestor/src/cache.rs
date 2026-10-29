@@ -196,15 +196,15 @@ impl Blocks {
             return false;
         }
 
-        let cached = self
-            .cache
-            .memory()
-            .get(key)
-            .is_some_and(|entry| entry.value().data.as_ptr() == block.data.as_ptr());
-        if cached {
-            self.cache.storage_writer(key.clone()).insert(block.clone());
+        let Some(entry) = self.cache.memory().get(key) else {
+            return false;
+        };
+        if entry.value().data.as_ptr() != block.data.as_ptr() {
+            return false;
         }
-        cached
+
+        self.cache.storage().enqueue(entry.piece(), true);
+        true
     }
 
     pub fn remove(&self, key: &BlockKey) {
