@@ -1091,3 +1091,24 @@ async fn inserted_blocks_need_two_reads_to_reach_disk() {
     let kept = kept_on_disk(disk(dir.path(), DiskAdmission::Reused), &["once", "twice"]).await;
     assert_eq!(kept, [false, true]);
 }
+
+#[tokio::test]
+async fn an_invalidated_object_stays_gone_after_a_restart() {
+    for admission in [DiskAdmission::Fetched, DiskAdmission::Reused] {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = stored(&["obj"]);
+        let (nestor, id) = hybrid(
+            disk(dir.path(), admission),
+            namespace(origin, Consistency::Immutable),
+        )
+        .await;
+
+        nestor.read(id, "obj", 0..OBJECT).await.unwrap();
+        nestor.read(id, "obj", 0..OBJECT).await.unwrap();
+        nestor.invalidate(id, "obj").unwrap();
+        nestor.close().await.unwrap();
+
+        let kept = kept_on_disk(disk(dir.path(), admission), &["obj"]).await;
+        assert_eq!(kept, [false], "{admission:?}");
+    }
+}

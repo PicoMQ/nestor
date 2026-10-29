@@ -86,4 +86,6 @@ Under `evicted`, `close` writes the blocks in RAM to disk.
 
 Recovery scans the regions on disk and rebuilds the index, so an endpoint restarted with the same path serves hits from disk immediately. Only the metadata cache is lost, and it refills from the first read of each object as described in [Consistency](/docs/design/consistency).
 
+Removals, such as `invalidate`, are kept in a tombstone log that recovery applies, so a removed block stays removed. The log takes `capacity / 256` of the disk.
+
 Removing the path, or starting with `recover = "none"`, is a full cold start. Since Nestor holds no state the origin does not also hold, that is always safe.

@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use foyer::{
     BlockEngineConfig, Cache, CacheBuilder, CacheProperties, Compression, DeviceBuilder,
-    FsDeviceBuilder, HybridCache, HybridCacheBuilder, HybridCachePolicy, LruConfig, RecoverMode,
-    S3FifoConfig, Source, Statistics, StorageFilter, StorageFilterCondition, StorageFilterResult,
+    FsDeviceBuilder, HybridCache, HybridCacheBuilder, HybridCachePolicy, HybridCacheProperties,
+    Location, LruConfig, RecoverMode, S3FifoConfig, Source,
 };
 use mixtrics::metrics::BoxedRegistry;
 
@@ -150,7 +150,7 @@ impl Blocks {
         let reads = reused.then(|| Reads::new(tracked(config.memory, smallest)));
 
         Ok(Self {
-            cache: hybrid(config, metrics, reads.clone()).await?,
+            cache: hybrid(config, metrics).await?,
             reads,
         })
     }
@@ -177,7 +177,15 @@ impl Blocks {
     }
 
     pub fn insert(&self, key: BlockKey, block: Block) {
-        self.cache.insert(key, block);
+        let location = match self.reads {
+            Some(_) => Location::InMem,
+            None => Location::Default,
+        };
+        self.cache.insert_with_properties(
+            key,
+            block,
+            HybridCacheProperties::default().with_location(location),
+        );
     }
 
     pub fn record_read(&self, key: &BlockKey, block: &Block) -> bool {
@@ -266,20 +274,8 @@ impl Reads {
         }
     }
 
-    fn count(&self, hash: u64) -> u8 {
-        self.0
-            .get(&hash)
-            .map_or(0, |entry| entry.value().load(Ordering::Relaxed))
-    }
-
     fn forget(&self, hash: u64) {
         self.0.remove(&hash);
-    }
-}
-
-impl std::fmt::Debug for Reads {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Reads").finish_non_exhaustive()
     }
 }
 
@@ -287,23 +283,9 @@ fn tracked(memory: usize, block_size: BlockSize) -> usize {
     2 * memory / block_size.usize()
 }
 
-#[derive(Debug)]
-struct Reused(Reads);
-
-impl StorageFilterCondition for Reused {
-    fn filter(&self, _: &Arc<Statistics>, hash: u64, _: usize) -> StorageFilterResult {
-        if self.0.count(hash) >= REUSED_READS {
-            StorageFilterResult::Admit
-        } else {
-            StorageFilterResult::Reject
-        }
-    }
-}
-
 async fn hybrid(
     config: &CacheConfig,
     metrics: Option<BoxedRegistry>,
-    reads: Option<Reads>,
 ) -> foyer::Result<HybridCache<BlockKey, Block>> {
     let mut builder = HybridCacheBuilder::new()
         .with_name("nestor")
@@ -329,15 +311,13 @@ async fn hybrid(
     let device = device.with_direct(disk.direct_io);
     let device = device.build()?;
 
-    let mut engine = BlockEngineConfig::new(device)
+    let engine = BlockEngineConfig::new(device)
         .with_block_size(disk.region_size)
         .with_flushers(disk.flushers)
         .with_reclaimers(disk.reclaimers)
         .with_buffer_pool_size(disk.buffer_pool())
-        .with_indexer_shards(config.shards.max(64));
-    if let Some(reads) = reads {
-        engine = engine.with_admission_filter(StorageFilter::new().with_condition(Reused(reads)));
-    }
+        .with_indexer_shards(config.shards.max(64))
+        .with_tombstone_log(true);
 
     let threads = disk.runtime_threads();
     if threads == 0 {
