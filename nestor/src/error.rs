@@ -75,6 +75,14 @@ impl NestorError {
             _ => false,
         }
     }
+
+    pub fn is_cancelled(&self) -> bool {
+        match self {
+            Self::Cancelled => true,
+            Self::Shared(inner) => inner.is_cancelled(),
+            _ => false,
+        }
+    }
 }
 
 impl From<Arc<NestorError>> for NestorError {

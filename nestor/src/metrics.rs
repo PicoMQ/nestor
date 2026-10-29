@@ -7,6 +7,8 @@ pub const BLOCKS_HIT: &str = "nestor_blocks_hit_total";
 pub const BLOCKS_MISS: &str = "nestor_blocks_miss_total";
 pub const BLOCKS_JOINED: &str = "nestor_blocks_joined_total";
 pub const BLOCKS_STALE: &str = "nestor_blocks_stale_total";
+pub const BLOCKS_REUSED: &str = "nestor_blocks_reused_total";
+pub const BLOCKS_EXTRA: &str = "nestor_blocks_extra_total";
 pub const ORIGIN_REQUESTS: &str = "nestor_origin_requests_total";
 pub const ORIGIN_BYTES: &str = "nestor_origin_bytes_total";
 pub const ORIGIN_ERRORS: &str = "nestor_origin_errors_total";
@@ -48,6 +50,8 @@ pub(crate) struct NamespaceMetrics {
     pub misses: Counter,
     pub joined: Counter,
     pub stale: Counter,
+    pub reused: Counter,
+    pub extra: Counter,
     pub origin_requests: Counter,
     pub origin_bytes: Counter,
     pub origin_errors: Counter,
@@ -70,6 +74,8 @@ impl NamespaceMetrics {
             misses: counter!(BLOCKS_MISS, LABEL_NAMESPACE => ns.clone()),
             joined: counter!(BLOCKS_JOINED, LABEL_NAMESPACE => ns.clone()),
             stale: counter!(BLOCKS_STALE, LABEL_NAMESPACE => ns.clone()),
+            reused: counter!(BLOCKS_REUSED, LABEL_NAMESPACE => ns.clone()),
+            extra: counter!(BLOCKS_EXTRA, LABEL_NAMESPACE => ns.clone()),
             origin_requests: counter!(ORIGIN_REQUESTS, LABEL_NAMESPACE => ns.clone()),
             origin_bytes: counter!(ORIGIN_BYTES, LABEL_NAMESPACE => ns.clone()),
             origin_errors: counter!(ORIGIN_ERRORS, LABEL_NAMESPACE => ns.clone()),

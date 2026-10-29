@@ -124,13 +124,13 @@ impl Origin for MyBackend {
 }
 ```
 
-`GetResponse` is the object's metadata, the byte range actually returned and a body stream. The fetcher relies on the range being exactly what was asked or a prefix of it ending at the object size. `OriginError` variants tell the fetcher what to do: `Io`, `ShortRead` and `Timeout` are retried, `NotFound`, `PreconditionFailed` and `NotModified` are final. An origin does not need to recognise a range past the end of the object, the fetcher settles that with a `HEAD`.
+`GetResponse` is the object's metadata, the byte range actually returned and a body stream. The range is what was asked, a prefix of it ending at the object size, or a [wider range](/docs/design/fetches#wider-responses). `OriginError` variants tell the fetcher what to do: `Io`, `ShortRead` and `Timeout` are retried, `NotFound`, `PreconditionFailed` and `NotModified` are final. An origin does not need to recognise a range past the end of the object, the fetcher settles that with a `HEAD`.
 
 Most applications will not implement this. `nestor_store::ObjectStoreOrigin` covers every `object_store` backend and `nestor_client::ClusterOrigin` covers a cluster of nodes. `MemoryOrigin`, in this crate, is an in-process origin for tests with `set_latency`, `slow_next` and `fail_next` to script origin behaviour and `gets` and `heads` counters to assert on it.
 
 ## Shutdown
 
-`close` flushes the disk tier and stops the engine. Call it once from the owner on shutdown, later calls are no-ops. Dropping without `close` loses only the unflushed write buffer.
+`close` flushes the disk tier and stops the engine. Call it once from the owner on shutdown, later calls are no-ops. Dropping without `close` loses the unflushed write buffer, and under `admission = "evicted"` the blocks only in RAM.
 
 ## Metrics
 

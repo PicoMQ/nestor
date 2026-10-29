@@ -3,17 +3,17 @@
 
 use std::ops::Range;
 
-use crate::cache::{ObjectCache, object_lru};
+use crate::cache::{Lru, lru};
 use crate::key::ObjectKey;
 
 pub(crate) struct Readahead {
-    last_end: ObjectCache<u64>,
+    last_end: Lru<ObjectKey, u64>,
 }
 
 impl Readahead {
     pub fn new(capacity: usize) -> Self {
         Self {
-            last_end: object_lru("nestor-readahead", capacity),
+            last_end: lru("nestor-readahead", capacity),
         }
     }
 

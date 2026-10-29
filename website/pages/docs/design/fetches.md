@@ -35,7 +35,7 @@ A read needs the object's size and `ETag` before it can resolve open ranges or t
 </svg>
 </div>
 
-The probe requests the blocks the read would fetch first anyway. The `Content-Range` total gives the size, the `ETag` header gives the tag, and the body is consumed as a normal fetch group so nothing is thrown away. If the metadata cache had an expired entry, the probe carries `If-None-Match` and a `304` refreshes the entry for free. Bounded reads in immutable namespaces skip the probe entirely because they need neither the size nor a tag.
+The probe requests the blocks the read would fetch first anyway. The `Content-Range` total gives the size, the `ETag` header gives the tag, and the body is consumed as a normal fetch group so nothing is thrown away. If the metadata cache had an expired entry, the probe carries `If-None-Match` and a `304` refreshes the entry for free. Bounded reads in immutable namespaces skip the probe entirely because they need neither the size nor a tag. Other reads in immutable namespaces take the size from a cached block of the object when there is one, so a restart serves them from disk.
 
 The only read that still pays a `HEAD` is a suffix range on an object of unknown size, since its first block cannot be computed without the total.
 
@@ -127,6 +127,19 @@ Headers unanswered after the delay get a second identical request and the first 
 A `GET` that fails while the object's size is unknown may have asked past the end, and origins report that like any other error. One `HEAD` settles it: a range starting at or beyond the size resolves to empty blocks, anything else goes to the retry policy with the original error.
 
 Out of attempts fails the waiting readers with the last error, out of deadline fails them with a timeout. A short read is a body that ended before the requested range did.
+
+## Wider responses
+
+An origin may answer a ranged `GET` with a wider range, up to the whole object. The range starts on a block boundary at or before the requested start and covers the request. Any other range is a short read.
+
+- Blocks before and after the request that are not cached or in flight are registered as in flight, so a read of one of them waits for this response.
+- Blocks before the request are cached as the body is read.
+- Requested blocks go to their readers as with any response.
+- Blocks after the request are cached from the same stream once every reader is answered. They are not hedged or retried, and an error while reading them fails no read.
+- A read waiting on a block the response did not deliver fetches the block itself, once.
+- A partial block at the end is dropped, unless it is the object's last block.
+- A hedge backup may be wider too. Its bytes before the owed block are skipped.
+- The attempt deadline covers every block up to the last requested one, including the blocks before the request.
 
 ## Readahead
 

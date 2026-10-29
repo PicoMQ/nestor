@@ -3,7 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::cache::{ObjectCache, object_lru};
+use crate::cache::{Lru, lru};
 use crate::key::ObjectKey;
 use crate::origin::ObjectMeta;
 
@@ -20,13 +20,13 @@ pub(crate) enum MetaLookup {
 }
 
 pub(crate) struct MetaCache {
-    cache: ObjectCache<MetaEntry>,
+    cache: Lru<ObjectKey, MetaEntry>,
 }
 
 impl MetaCache {
     pub fn new(capacity: usize) -> Self {
         Self {
-            cache: object_lru("nestor-meta", capacity),
+            cache: lru("nestor-meta", capacity),
         }
     }
 

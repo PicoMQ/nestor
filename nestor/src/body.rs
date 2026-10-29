@@ -1,11 +1,11 @@
 //! The body of an origin attempt cut into blocks. `BlockStream` buffers chunks until a whole block
 //! is available. `HedgedBody` races the primary stream against a backup request for the range still
 //! owed when a block takes longer than the namespace's hedge delay, and the first stream to complete
-//! the next block carries on.
+//! the next block carries on. A wider backup skips to the owed block.
 
 use std::time::{Duration, Instant};
 
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
@@ -19,6 +19,7 @@ use crate::origin::{GetOptions, GetResponse};
 pub(crate) struct BlockStream {
     body: BoxStream<'static, Result<Bytes, OriginError>>,
     buf: BytesMut,
+    skip: u64,
     since: Instant,
 }
 
@@ -27,8 +28,14 @@ impl BlockStream {
         Self {
             body,
             buf: BytesMut::new(),
+            skip: 0,
             since: Instant::now(),
         }
+    }
+
+    fn skipping(mut self, bytes: u64) -> Self {
+        self.skip = bytes;
+        self
     }
 
     pub async fn next_block(&mut self, expected: usize) -> Result<Bytes, OriginError> {
@@ -43,6 +50,11 @@ impl BlockStream {
                 });
             };
             let mut chunk = chunk?;
+            if self.skip > 0 {
+                let skipped = chunk.len().min(self.skip as usize);
+                chunk.advance(skipped);
+                self.skip -= skipped as u64;
+            }
             if self.buf.is_empty() && chunk.len() >= expected {
                 let block = chunk.split_to(expected);
                 self.buf.extend_from_slice(&chunk);
@@ -108,6 +120,10 @@ impl<'a> HedgedBody<'a> {
 
     pub fn lap(&mut self) -> Duration {
         self.primary.lap()
+    }
+
+    pub fn into_stream(self) -> BlockStream {
+        self.primary
     }
 
     pub async fn next_block(&mut self, index: u32, expected: usize) -> Result<Bytes, OriginError> {
@@ -198,7 +214,12 @@ impl<'a> HedgedBody<'a> {
         let response = response.ok()?;
         let tag = content_tag(response.meta.etag.as_ref(), response.meta.size);
         let consistent = self.ctx.tag == IMMUTABLE_TAG || tag == self.ctx.tag;
-        (consistent && response.range.start == start).then(|| BlockStream::new(response.body))
+        let aligned = response
+            .range
+            .start
+            .is_multiple_of(self.ctx.namespace.config.block_size.bytes());
+        let behind = start.checked_sub(response.range.start)?;
+        (consistent && aligned).then(|| BlockStream::new(response.body).skipping(behind))
     }
 }
 

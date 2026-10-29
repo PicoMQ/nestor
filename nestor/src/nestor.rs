@@ -10,9 +10,10 @@ use bytes::Bytes;
 use mixtrics::metrics::BoxedRegistry;
 
 use crate::block::ReadRange;
-use crate::cache::{self, CacheConfig};
+use crate::cache::{Blocks, CacheConfig};
 use crate::error::{NestorError, Result};
 use crate::fetch::{Fetcher, Priority, ReadCtx};
+use crate::inflight::SlotHandle;
 use crate::key::{Block, BlockKey, IMMUTABLE_TAG, NamespaceId, ObjectKey, block_tag};
 use crate::meta::{MetaCache, MetaLookup};
 use crate::namespace::{Namespace, NamespaceState};
@@ -53,42 +54,54 @@ impl Engine {
         name: &Arc<str>,
         request: &ReadRange,
         policy: FetchPolicy,
-    ) -> Result<Arc<ReadCtx>> {
+    ) -> Result<(Arc<ReadCtx>, Vec<SlotHandle>)> {
         let key = ObjectKey::new(ns.id, name);
         let stale = match self.meta.lookup(&key, ns.meta_ttl()) {
             MetaLookup::Fresh(meta) => {
-                return Ok(ReadCtx::new(
-                    Arc::clone(ns),
-                    key,
-                    Arc::clone(name),
-                    Some(meta),
-                    policy,
-                ));
+                let ctx = ReadCtx::new(Arc::clone(ns), key, Arc::clone(name), Some(meta), policy);
+                return Ok((ctx, Vec::new()));
             }
             MetaLookup::Stale(meta) => Some(meta),
             MetaLookup::Missing => None,
         };
-        if ns.config.consistency.is_immutable() && !request.needs_size() {
-            return Ok(ReadCtx::new(
-                Arc::clone(ns),
-                key,
-                Arc::clone(name),
-                None,
-                policy,
-            ));
+        if ns.config.consistency.is_immutable() {
+            if !request.needs_size() {
+                let ctx = ReadCtx::new(Arc::clone(ns), key, Arc::clone(name), None, policy);
+                return Ok((ctx, Vec::new()));
+            }
+            if let Some(meta) = self.cached_meta(ns, &key, request).await {
+                let ctx = ReadCtx::new(Arc::clone(ns), key, Arc::clone(name), Some(meta), policy);
+                return Ok((ctx, Vec::new()));
+            }
         }
         let window = ns.config.fetch_window;
         if let Some(indexes) = ns.config.block_size.first_group(request, window) {
             return self.fetcher.probe(ns, name, indexes, stale, policy).await;
         }
         let meta = self.fetcher.head(ns, &key, name).await?;
-        Ok(ReadCtx::new(
-            Arc::clone(ns),
-            key,
-            Arc::clone(name),
-            Some(meta),
-            policy,
-        ))
+        let ctx = ReadCtx::new(Arc::clone(ns), key, Arc::clone(name), Some(meta), policy);
+        Ok((ctx, Vec::new()))
+    }
+
+    async fn cached_meta(
+        &self,
+        ns: &NamespaceState,
+        key: &ObjectKey,
+        request: &ReadRange,
+    ) -> Option<ObjectMeta> {
+        let index = ns
+            .config
+            .block_size
+            .first_group(request, 1)
+            .map_or(0, |group| group.start);
+        let block = self
+            .fetcher
+            .blocks
+            .get(&BlockKey::new(key, IMMUTABLE_TAG, index))
+            .await?;
+
+        self.meta.put(key.clone(), block.meta.clone());
+        Some(block.meta)
     }
 }
 
@@ -194,10 +207,16 @@ impl NestorBuilder {
     }
 
     pub async fn build(self) -> Result<Nestor> {
-        let cache = cache::build(&self.cache, self.metrics).await?;
+        let smallest = self
+            .namespaces
+            .iter()
+            .map(|ns| ns.config.block_size)
+            .min_by_key(|block_size| block_size.bytes())
+            .unwrap_or_default();
+        let blocks = Blocks::open(&self.cache, self.metrics, smallest).await?;
         let meta = Arc::new(MetaCache::new(self.meta_capacity));
         let fetcher = Fetcher::new(
-            cache,
+            blocks,
             Arc::clone(&meta),
             self.origin_concurrency,
             self.readahead_concurrency,
@@ -234,6 +253,10 @@ impl Nestor {
             return *id;
         }
         let id = NamespaceId(registry.states.len() as u32);
+        self.engine
+            .fetcher
+            .blocks
+            .track(namespace.config.block_size);
         registry.by_name.insert(Arc::clone(&namespace.name), id);
         registry
             .states
@@ -265,13 +288,12 @@ impl Nestor {
             .registry
             .read()
             .unwrap_or_else(|e| e.into_inner());
-        let cache = &self.engine.fetcher.cache;
-        let memory = cache.memory();
+        let blocks = &self.engine.fetcher.blocks;
         NodeSnapshot {
             cache: CacheSnapshot {
-                memory_used: memory.usage(),
-                memory_cap: memory.capacity(),
-                disk_cap: self.engine.disk_cap.filter(|_| cache.is_hybrid()),
+                memory_used: blocks.memory_usage(),
+                memory_cap: blocks.memory_capacity(),
+                disk_cap: self.engine.disk_cap.filter(|_| blocks.has_disk()),
                 meta_used: self.engine.meta.usage(),
                 meta_cap: self.engine.meta.capacity(),
                 inflight: self.engine.fetcher.inflight(),
@@ -326,7 +348,7 @@ impl Nestor {
         } = options;
         let policy = state.config.fetch.with(&fetch);
         let name: Arc<str> = Arc::from(object);
-        let ctx = self
+        let (ctx, fetched) = self
             .engine
             .resolve_ctx(&state, &name, &request, policy)
             .await?;
@@ -345,7 +367,7 @@ impl Nestor {
             self.spawn_readahead(&state, &ctx, &range);
         }
 
-        Ok(Reader::new(Arc::clone(&self.engine), request, ctx, range).into_stream())
+        Ok(Reader::new(Arc::clone(&self.engine), request, ctx, range, fetched).into_stream())
     }
 
     fn spawn_readahead(&self, state: &NamespaceState, ctx: &Arc<ReadCtx>, range: &Range<u64>) {
@@ -389,11 +411,11 @@ impl Nestor {
         let key = ObjectKey::new(ns, object);
         let tag = block_tag(state.config.consistency, &meta);
         let bs = state.config.block_size;
-        let cache = &self.engine.fetcher.cache;
+        let blocks = &self.engine.fetcher.blocks;
         for index in 0..bs.count(meta.size) {
             let range = bs.block_range(index, Some(meta.size));
             let block = data.slice(range.start as usize..range.end as usize);
-            cache.insert(
+            blocks.insert(
                 BlockKey::new(&key, tag, index),
                 Block::new(meta.clone(), block),
             );
@@ -413,7 +435,7 @@ impl Nestor {
             for index in 0..bs.count(meta.size) {
                 self.engine
                     .fetcher
-                    .cache
+                    .blocks
                     .remove(&BlockKey::new(&key, IMMUTABLE_TAG, index));
             }
         }
@@ -425,7 +447,7 @@ impl Nestor {
         if self.engine.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        self.engine.fetcher.cache.close().await?;
+        self.engine.fetcher.blocks.close().await?;
         Ok(())
     }
 }

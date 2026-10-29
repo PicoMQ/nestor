@@ -1,5 +1,6 @@
 //! Streaming reads. `Reader` walks the blocks covering a range with a bounded window in flight and
-//! slices each block to the requested bytes. `ReadStream` is the public handle.
+//! slices each block to the requested bytes, counting each block read for disk admission.
+//! `ReadStream` is the public handle.
 
 use std::collections::VecDeque;
 use std::ops::Range;
@@ -14,6 +15,7 @@ use crate::block::{ReadRange, aligned_take};
 use crate::error::{NestorError, Result};
 use crate::fetch::{Priority, ReadCtx};
 use crate::inflight::SlotHandle;
+use crate::key::BlockKey;
 use crate::nestor::Engine;
 use crate::origin::ObjectMeta;
 
@@ -112,6 +114,7 @@ pub(crate) struct Reader {
     emit: u32,
     window: VecDeque<SlotHandle>,
     restarted: bool,
+    refetched: Option<u32>,
     done: bool,
 }
 
@@ -121,6 +124,7 @@ impl Reader {
         request: ReadRange,
         ctx: Arc<ReadCtx>,
         range: Range<u64>,
+        fetched: Vec<SlotHandle>,
     ) -> Self {
         let blocks = ctx.namespace.config.block_size.blocks(&range);
         let known = Arc::new(OnceLock::new());
@@ -134,11 +138,12 @@ impl Reader {
             ctx,
             range,
             first: blocks.start,
-            next: blocks.start,
+            next: blocks.start + fetched.len() as u32,
             end: blocks.end,
             emit: blocks.start,
-            window: VecDeque::new(),
+            window: VecDeque::from(fetched),
             restarted: false,
+            refetched: None,
             done: false,
         }
     }
@@ -206,7 +211,7 @@ impl Reader {
     async fn restart(&mut self) -> Result<()> {
         self.restarted = true;
         self.window.clear();
-        let ctx = self
+        let (ctx, fetched) = self
             .engine
             .resolve_ctx(
                 &self.ctx.namespace,
@@ -221,9 +226,10 @@ impl Reader {
         self.ctx = ctx;
         self.known = Arc::new(OnceLock::from(meta));
         self.first = blocks.start;
-        self.next = blocks.start;
+        self.next = blocks.start + fetched.len() as u32;
         self.end = blocks.end;
         self.emit = blocks.start;
+        self.window = VecDeque::from(fetched);
         Ok(())
     }
 
@@ -241,11 +247,10 @@ impl Reader {
             self.emit += 1;
             match handle.wait().await {
                 Ok(block) => {
-                    self.learn(Some(block.meta));
-                    let block = block.data;
+                    self.learn(Some(block.meta.clone()));
                     let bs = self.ctx.namespace.config.block_size;
                     let within = bs.slice_within(index, &self.range);
-                    if block.is_empty() || within.start >= block.len() {
+                    if block.data.is_empty() || within.start >= block.data.len() {
                         self.done = true;
                         if index == self.first {
                             let size = self.size().unwrap_or(0);
@@ -253,6 +258,12 @@ impl Reader {
                         }
                         return None;
                     }
+                    let key = BlockKey::new(&self.ctx.key, self.ctx.tag, index);
+                    let written = self.engine.fetcher.blocks.record_read(&key, &block);
+                    if written {
+                        self.ctx.namespace.metrics.reused.increment(1);
+                    }
+                    let block = block.data;
                     let end = within.end.min(block.len());
                     let out = block.slice(within.start..end);
                     if block.len() < bs.usize() || index + 1 >= self.end {
@@ -264,6 +275,18 @@ impl Reader {
                         .bytes_served
                         .increment(out.len() as u64);
                     return Some(Ok(out));
+                }
+                Err(e) if e.is_cancelled() && self.refetched != Some(index) => {
+                    self.refetched = Some(index);
+                    self.emit = index;
+                    let handles = self
+                        .engine
+                        .fetcher
+                        .schedule(&self.ctx, index..index + 1, Priority::Foreground)
+                        .await;
+                    for handle in handles.into_iter().rev() {
+                        self.window.push_front(handle);
+                    }
                 }
                 Err(e) if e.is_stale() && !self.restarted && index == self.first => {
                     if let Err(e) = self.restart().await {

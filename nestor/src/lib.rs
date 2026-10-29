@@ -21,7 +21,7 @@ mod readahead;
 mod reader;
 
 pub use block::{BlockSize, MAX_BLOCK_SIZE, MIN_BLOCK_SIZE, ReadRange};
-pub use cache::{CacheConfig, DiskConfig, DiskIo};
+pub use cache::{CacheConfig, DiskAdmission, DiskConfig, DiskIo};
 pub use error::{NestorError, OriginError, Result};
 pub use foyer::{Compression, RecoverMode};
 pub use key::NamespaceId;

@@ -1,4 +1,5 @@
 //! Origin fetch scheduling: grouped, deduplicated, bounded and driven by the read's `FetchPolicy`.
+//! Every whole block of a wider response is cached.
 
 use std::collections::VecDeque;
 use std::ops::Range;
@@ -11,8 +12,8 @@ use futures::future::join_all;
 use tokio::sync::Semaphore;
 
 use crate::block::group_misses;
-use crate::body::HedgedBody;
-use crate::cache::BlockCache;
+use crate::body::{BlockStream, HedgedBody};
+use crate::cache::Blocks;
 use crate::error::{NestorError, OriginError};
 use crate::inflight::{Inflight, Registration, Slot, SlotHandle};
 use crate::key::{Block, BlockKey, IMMUTABLE_TAG, ObjectKey, block_tag, content_tag};
@@ -74,7 +75,7 @@ impl ReadCtx {
 }
 
 pub(crate) struct Fetcher {
-    pub(crate) cache: BlockCache,
+    pub(crate) blocks: Blocks,
     inflight: Arc<Inflight>,
     meta: Arc<MetaCache>,
     foreground: Semaphore,
@@ -84,14 +85,14 @@ pub(crate) struct Fetcher {
 
 impl Fetcher {
     pub fn new(
-        cache: BlockCache,
+        blocks: Blocks,
         meta: Arc<MetaCache>,
         origin_concurrency: usize,
         readahead_concurrency: usize,
         hedge_concurrency: usize,
     ) -> Arc<Self> {
         Arc::new(Self {
-            cache,
+            blocks,
             inflight: Inflight::new(64),
             meta,
             foreground: Semaphore::new(origin_concurrency.max(1)),
@@ -113,7 +114,7 @@ impl Fetcher {
         let lookups = indexes.map(|index| {
             let key = BlockKey::new(&ctx.key, ctx.tag, index);
             async move {
-                let found = self.cache.get(&key).await;
+                let found = self.blocks.get(&key).await;
                 (key, found)
             }
         });
@@ -124,11 +125,11 @@ impl Fetcher {
         let mut owners: Vec<Slot> = Vec::new();
         for (key, found) in results {
             match found {
-                Ok(Some(entry)) => {
+                Some(block) => {
                     metrics.hits.increment(1);
-                    handles.push(SlotHandle::resolved(Ok(entry.value().clone())));
+                    handles.push(SlotHandle::resolved(Ok(block)));
                 }
-                Ok(None) | Err(_) => match self.inflight.register(key) {
+                None => match self.inflight.register(key) {
                     Registration::Owner(slot, handle) => {
                         owners.push(slot);
                         handles.push(handle);
@@ -144,14 +145,14 @@ impl Fetcher {
         if owners.is_empty() {
             return handles;
         }
-        let landed = join_all(owners.iter().map(|slot| self.cache.get(slot.key()))).await;
+        let landed = join_all(owners.iter().map(|slot| self.blocks.get(slot.key()))).await;
         let owners: Vec<Slot> = owners
             .into_iter()
             .zip(landed)
             .filter_map(|(slot, found)| {
-                if let Ok(Some(entry)) = found {
+                if let Some(block) = found {
                     metrics.hits.increment(1);
-                    slot.resolve(Ok(entry.value().clone()));
+                    slot.resolve(Ok(block));
                     None
                 } else {
                     metrics.misses.increment(1);
@@ -215,7 +216,7 @@ impl Fetcher {
         indexes: Range<u32>,
         stale: Option<ObjectMeta>,
         policy: FetchPolicy,
-    ) -> Result<Arc<ReadCtx>, NestorError> {
+    ) -> Result<(Arc<ReadCtx>, Vec<SlotHandle>), NestorError> {
         let key = ObjectKey::new(ns.id, name);
         let ctx = ReadCtx::new(Arc::clone(ns), key.clone(), Arc::clone(name), None, policy);
         let bs = ns.config.block_size;
@@ -240,12 +241,12 @@ impl Fetcher {
             match self.origin_get(&ctx, options.clone(), deadline).await {
                 Ok(response) => {
                     let ctx = build(response.meta.clone());
-                    self.adopt(&ctx, indexes, response);
-                    return Ok(ctx);
+                    let fetched = self.adopt(&ctx, indexes, response);
+                    return Ok((ctx, fetched));
                 }
                 Err(OriginError::NotModified) => {
                     let meta = stale.ok_or(NestorError::Origin(OriginError::NotModified))?;
-                    return Ok(build(meta));
+                    return Ok((build(meta), Vec::new()));
                 }
                 Err(OriginError::NotFound) => {
                     self.meta.remove(&key);
@@ -255,7 +256,7 @@ impl Fetcher {
                     ns.metrics.origin_errors.increment(1);
                     let start = bs.offset(indexes.start);
                     if let Some(meta) = self.past_end(ns, &key, name, start).await {
-                        return Ok(build(meta));
+                        return Ok((build(meta), Vec::new()));
                     }
                     retry.failed(e).await?;
                     ns.metrics.origin_retries.increment(1);
@@ -275,21 +276,28 @@ impl Fetcher {
         (start >= meta.size).then_some(meta)
     }
 
-    fn adopt(self: &Arc<Self>, ctx: &Arc<ReadCtx>, indexes: Range<u32>, response: GetResponse) {
+    fn adopt(
+        self: &Arc<Self>,
+        ctx: &Arc<ReadCtx>,
+        indexes: Range<u32>,
+        response: GetResponse,
+    ) -> Vec<SlotHandle> {
         let end = indexes
             .end
             .min(ctx.namespace.config.block_size.count(response.meta.size));
-        let slots: VecDeque<Slot> = (indexes.start..end)
+        let (slots, fetched): (VecDeque<Slot>, Vec<SlotHandle>) = (indexes.start..end)
             .map_while(|index| {
                 match self
                     .inflight
                     .register(BlockKey::new(&ctx.key, ctx.tag, index))
                 {
-                    Registration::Owner(slot, _) => Some(slot),
+                    Registration::Owner(slot, handle) => Some((slot, handle)),
                     Registration::Waiter(_) => None,
                 }
             })
-            .collect();
+            .unzip();
+
+        ctx.namespace.metrics.misses.increment(slots.len() as u64);
         if !slots.is_empty() {
             tokio::spawn(Arc::clone(self).fetch_group(
                 Arc::clone(ctx),
@@ -298,6 +306,7 @@ impl Fetcher {
                 Some(response),
             ));
         }
+        fetched
     }
 
     async fn fetch_group(
@@ -311,7 +320,7 @@ impl Fetcher {
             Priority::Foreground => &self.foreground,
             Priority::Background => &self.background,
         };
-        let Ok(_permit) = semaphore.acquire().await else {
+        let Ok(permit) = semaphore.acquire().await else {
             return;
         };
 
@@ -357,7 +366,15 @@ impl Fetcher {
                         Err(OriginError::Timeout(ctx.policy.attempt))
                     });
                     match accepted {
-                        Ok(()) => return,
+                        Ok(trailing) => {
+                            drop(permit);
+                            if let Some(trailing) = trailing {
+                                let filled = self.fill_trailing(&ctx, trailing);
+                                let _ =
+                                    tokio::time::timeout_at(attempt_deadline.into(), filled).await;
+                            }
+                            return;
+                        }
                         Err(e) => {
                             metrics.origin_errors.increment(1);
                             if !Self::retry_or_fail(&ctx, &mut retry, &mut slots, e).await {
@@ -401,16 +418,17 @@ impl Fetcher {
         response: GetResponse,
         slots: &mut VecDeque<Slot>,
         range: &Range<u64>,
-    ) -> Result<(), OriginError> {
+    ) -> Result<Option<Trailing>, OriginError> {
         self.meta.put(ctx.key.clone(), response.meta.clone());
         if ctx.tag != IMMUTABLE_TAG
             && content_tag(response.meta.etag.as_ref(), response.meta.size) != ctx.tag
         {
             ctx.namespace.metrics.stale.increment(1);
             resolve_all(std::mem::take(slots), &Err(Arc::new(NestorError::Stale)));
-            return Ok(());
+            return Ok(None);
         }
-        if response.range.start != range.start {
+        let bs = ctx.namespace.config.block_size;
+        if response.range.start > range.start || !response.range.start.is_multiple_of(bs.bytes()) {
             return Err(OriginError::ShortRead {
                 expected: range.end - range.start,
                 got: 0,
@@ -503,15 +521,33 @@ impl Fetcher {
         response: GetResponse,
         slots: &mut VecDeque<Slot>,
         range_end: u64,
-    ) -> Result<(), OriginError> {
+    ) -> Result<Option<Trailing>, OriginError> {
         let ns = &ctx.namespace;
         let bs = ns.config.block_size;
         let meta = response.meta;
         let size = Some(meta.size);
+        let end = response.range.end.min(meta.size);
+        let mut next = bs.index(response.range.start);
         let mut body = HedgedBody::new(ctx, &self.hedges, response.body, range_end);
+
+        let first = slots
+            .front()
+            .map_or(next, |slot| slot.key().index)
+            .min(bs.count(meta.size));
+        while next < first {
+            let expected = bs.block_range(next, size).count();
+            let claimed = self.claim(ctx, next);
+            let block = body.next_block(next, expected).await?;
+            observe_block(ns, &mut body);
+            if let Some(slot) = claimed {
+                self.cache_extra(ctx, slot, &meta, block);
+            }
+            next += 1;
+        }
 
         while let Some(front) = slots.front() {
             let index = front.key().index;
+            next = index + 1;
             let expected = bs.block_range(index, size).count();
             if expected == 0 {
                 let slot = slots.pop_front().expect("front exists");
@@ -519,17 +555,89 @@ impl Fetcher {
                 continue;
             }
             let block = body.next_block(index, expected).await?;
-            let lap = body.lap();
-            ns.block.observe(lap);
-            ns.metrics.origin_block.record(lap.as_secs_f64());
+            observe_block(ns, &mut body);
             let slot = slots.pop_front().expect("front exists");
             ns.metrics.origin_bytes.increment(block.len() as u64);
             let block = Block::new(meta.clone(), block);
-            self.cache.insert(slot.key().clone(), block.clone());
+            self.blocks.insert(slot.key().clone(), block.clone());
             slot.resolve(Ok(block));
         }
-        Ok(())
+
+        let whole =
+            (next..bs.count(end)).take_while(|index| bs.block_range(*index, size).end <= end);
+        let slots: VecDeque<Slot> = whole.filter_map(|index| self.claim(ctx, index)).collect();
+        if slots.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(Trailing {
+            stream: body.into_stream(),
+            next,
+            slots,
+            meta,
+        }))
     }
+
+    async fn fill_trailing(&self, ctx: &ReadCtx, trailing: Trailing) {
+        let bs = ctx.namespace.config.block_size;
+        let Trailing {
+            mut stream,
+            mut next,
+            mut slots,
+            meta,
+        } = trailing;
+
+        while let Some(slot) = slots.pop_front() {
+            let index = slot.key().index;
+            while next < index {
+                let skipped = bs.block_range(next, Some(meta.size)).count();
+                if stream.next_block(skipped).await.is_err() {
+                    return;
+                }
+                next += 1;
+            }
+            let expected = bs.block_range(index, Some(meta.size)).count();
+            let Ok(block) = stream.next_block(expected).await else {
+                return;
+            };
+            self.cache_extra(ctx, slot, &meta, block);
+            next += 1;
+        }
+    }
+
+    fn claim(&self, ctx: &ReadCtx, index: u32) -> Option<Slot> {
+        let key = BlockKey::new(&ctx.key, ctx.tag, index);
+        if self.blocks.contains(&key) {
+            return None;
+        }
+
+        match self.inflight.register(key) {
+            Registration::Owner(slot, _) => Some(slot),
+            Registration::Waiter(_) => None,
+        }
+    }
+
+    fn cache_extra(&self, ctx: &ReadCtx, slot: Slot, meta: &ObjectMeta, data: Bytes) {
+        let metrics = &ctx.namespace.metrics;
+        metrics.origin_bytes.increment(data.len() as u64);
+        metrics.extra.increment(1);
+
+        let block = Block::new(meta.clone(), data);
+        self.blocks.insert(slot.key().clone(), block.clone());
+        slot.resolve(Ok(block));
+    }
+}
+
+struct Trailing {
+    stream: BlockStream,
+    next: u32,
+    slots: VecDeque<Slot>,
+    meta: ObjectMeta,
+}
+
+fn observe_block(ns: &NamespaceState, body: &mut HedgedBody<'_>) {
+    let lap = body.lap();
+    ns.block.observe(lap);
+    ns.metrics.origin_block.record(lap.as_secs_f64());
 }
 
 fn observe_ttfb(

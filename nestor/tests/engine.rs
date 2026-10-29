@@ -1,14 +1,16 @@
 //! Engine behaviour against `MemoryOrigin`: hits, misses, coalescing, hedging, readahead,
-//! consistency and invalidation.
+//! consistency, invalidation, wider responses and disk admission.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
 use futures::StreamExt;
 use nestor::{
-    BlockSize, CacheConfig, Consistency, DiskConfig, FetchOverrides, FetchPolicy, HedgeConfig,
-    MemoryOrigin, Namespace, NamespaceId, Nestor, NestorError, OriginError, ReadOptions, ReadRange,
+    BlockSize, CacheConfig, Consistency, DiskAdmission, DiskConfig, FetchOverrides, FetchPolicy,
+    GetOptions, GetResponse, HedgeConfig, MemoryOrigin, Namespace, NamespaceId, Nestor,
+    NestorError, ObjectMeta, Origin, OriginError, ReadOptions, ReadRange,
 };
 
 const KIB: usize = 1024;
@@ -28,7 +30,7 @@ async fn engine(ns: Namespace) -> (Nestor, NamespaceId) {
     (nestor, id)
 }
 
-fn namespace(origin: Arc<MemoryOrigin>, consistency: Consistency) -> Namespace {
+fn namespace(origin: Arc<dyn Origin>, consistency: Consistency) -> Namespace {
     Namespace::new("test", origin)
         .block_size(BlockSize::new(BLOCK as u32).unwrap())
         .fetch_window(4)
@@ -736,4 +738,430 @@ async fn snapshot_reports_live_cache_state() {
     assert!(snap.cache.meta_cap >= snap.cache.meta_used);
     assert!(snap.cache.memory_used > 0);
     assert_eq!(snap.cache.inflight, 0);
+}
+
+struct FixedRangeOrigin {
+    data: Bytes,
+    start: u64,
+    fail_at: Option<u64>,
+    failures: AtomicUsize,
+    gets: AtomicUsize,
+}
+
+impl FixedRangeOrigin {
+    fn new(data: Bytes, start: u64) -> Self {
+        Self {
+            data,
+            start,
+            fail_at: None,
+            failures: AtomicUsize::new(0),
+            gets: AtomicUsize::new(0),
+        }
+    }
+
+    fn failing(mut self, at: u64, times: usize) -> Self {
+        self.fail_at = Some(at);
+        self.failures = AtomicUsize::new(times);
+        self
+    }
+
+    fn gets(&self) -> usize {
+        self.gets.load(Ordering::Relaxed)
+    }
+}
+
+#[async_trait::async_trait]
+impl Origin for FixedRangeOrigin {
+    async fn get(&self, _: &str, _: GetOptions) -> Result<GetResponse, OriginError> {
+        self.gets.fetch_add(1, Ordering::Relaxed);
+        let size = self.data.len() as u64;
+        let failing = self
+            .failures
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok();
+        let end = self.fail_at.filter(|_| failing).unwrap_or(size);
+
+        let head = futures::stream::once(std::future::ready(Ok(self
+            .data
+            .slice(self.start as usize..end as usize))));
+        let body = if failing {
+            let error = futures::stream::once(async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Err(OriginError::io(std::io::Error::other("connection reset")))
+            });
+            head.chain(error).boxed()
+        } else {
+            head.boxed()
+        };
+
+        Ok(GetResponse {
+            meta: ObjectMeta::new(size, None),
+            range: self.start..size,
+            body,
+        })
+    }
+
+    async fn head(&self, _: &str) -> Result<ObjectMeta, OriginError> {
+        Ok(ObjectMeta::new(self.data.len() as u64, None))
+    }
+}
+
+#[tokio::test]
+async fn whole_object_responses_fill_every_block() {
+    let origin = Arc::new(MemoryOrigin::new().with_whole_objects());
+    let data = pattern(10 * BLOCK as usize + 7);
+    origin.put("obj", data.clone());
+    let (nestor, id) = engine(namespace(origin.clone(), Consistency::Immutable)).await;
+
+    let start = 5 * BLOCK;
+    let out = nestor.read(id, "obj", start..start + 10).await.unwrap();
+    assert_eq!(out, data.slice(start as usize..start as usize + 10));
+
+    assert_eq!(
+        nestor.read(id, "obj", 0..data.len() as u64).await.unwrap(),
+        data
+    );
+    assert_eq!(origin.gets(), 1);
+}
+
+#[tokio::test]
+async fn responses_start_on_a_block_boundary_at_or_before_the_request() {
+    let data = pattern(4 * BLOCK as usize);
+    let request = 2 * BLOCK..2 * BLOCK + 10;
+
+    for start in [BLOCK + 1, 3 * BLOCK] {
+        let origin = Arc::new(FixedRangeOrigin::new(data.clone(), start));
+        let (nestor, id) = engine(namespace(origin, Consistency::Immutable)).await;
+
+        let err = nestor.read(id, "obj", request.clone()).await.unwrap_err();
+        assert!(
+            matches!(err, NestorError::Origin(OriginError::ShortRead { .. })),
+            "{start}: {err:?}"
+        );
+    }
+
+    let origin = Arc::new(FixedRangeOrigin::new(data.clone(), BLOCK));
+    let (nestor, id) = engine(namespace(origin, Consistency::Immutable)).await;
+    let out = nestor.read(id, "obj", request.clone()).await.unwrap();
+    assert_eq!(out, data.slice(2 * BLOCK as usize..2 * BLOCK as usize + 10));
+}
+
+#[tokio::test]
+async fn an_error_after_the_requested_blocks_still_answers_the_read() {
+    let data = pattern(4 * BLOCK as usize);
+    let origin = Arc::new(FixedRangeOrigin::new(data.clone(), 0).failing(2 * BLOCK, 1));
+    let (nestor, id) = engine(namespace(origin.clone(), Consistency::Immutable)).await;
+
+    let out = nestor.read(id, "obj", 0..BLOCK).await.unwrap();
+    assert_eq!(out, data.slice(0..BLOCK as usize));
+
+    let out = nestor.read(id, "obj", BLOCK..2 * BLOCK).await.unwrap();
+    assert_eq!(out, data.slice(BLOCK as usize..2 * BLOCK as usize));
+    assert_eq!(origin.gets(), 1);
+}
+
+#[tokio::test]
+async fn a_reader_waiting_on_a_failed_trailing_block_fetches_it_itself() {
+    let data = pattern(4 * BLOCK as usize);
+    let origin = Arc::new(FixedRangeOrigin::new(data.clone(), 0).failing(2 * BLOCK, 1));
+    let (nestor, id) = engine(namespace(origin.clone(), Consistency::Immutable)).await;
+
+    nestor.read(id, "obj", 0..BLOCK).await.unwrap();
+    let out = nestor.read(id, "obj", 3 * BLOCK..4 * BLOCK).await.unwrap();
+
+    assert_eq!(out, data.slice(3 * BLOCK as usize..4 * BLOCK as usize));
+    assert_eq!(origin.gets(), 2);
+}
+
+#[tokio::test]
+async fn a_hedged_backup_may_answer_with_the_whole_object() {
+    let origin = Arc::new(
+        MemoryOrigin::new()
+            .with_chunk(BLOCK as usize)
+            .with_whole_objects(),
+    );
+    let data = pattern(4 * BLOCK as usize);
+    origin.put("obj", data.clone());
+    let mut ns = namespace(origin.clone(), Consistency::Immutable);
+    ns.config.fetch.hedge = Some(
+        HedgeConfig::factor(1.0, Duration::from_millis(20), Duration::from_millis(20)).unwrap(),
+    );
+    let (nestor, id) = engine(ns).await;
+
+    origin.stall_next(1, Duration::from_millis(500));
+    let started = std::time::Instant::now();
+    let out = nestor.read(id, "obj", 2 * BLOCK..4 * BLOCK).await.unwrap();
+    assert_eq!(out, data.slice(2 * BLOCK as usize..4 * BLOCK as usize));
+    assert!(
+        started.elapsed() < Duration::from_millis(400),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(origin.gets(), 2);
+}
+
+const OBJECT: u64 = 4 * BLOCK;
+
+fn disk(dir: &std::path::Path, admission: DiskAdmission) -> DiskConfig {
+    DiskConfig {
+        admission,
+        region_size: 4 * 1024 * 1024,
+        direct_io: false,
+        ..DiskConfig::new(dir, 64 * 1024 * 1024)
+    }
+}
+
+async fn hybrid(disk: DiskConfig, ns: Namespace) -> (Nestor, NamespaceId) {
+    let nestor = Nestor::builder(CacheConfig::memory(64 * 1024 * 1024).disk(disk))
+        .namespace(ns)
+        .build()
+        .await
+        .unwrap();
+    let id = nestor.namespace("test").unwrap();
+    (nestor, id)
+}
+
+async fn kept_on_disk(disk: DiskConfig, objects: &[&str]) -> Vec<bool> {
+    let offline = Arc::new(MemoryOrigin::new());
+    offline.fail_next(usize::MAX);
+    let (nestor, id) = hybrid(disk, namespace(offline, Consistency::Immutable)).await;
+
+    let mut kept = Vec::new();
+    for object in objects {
+        kept.push(nestor.read(id, object, 0..OBJECT).await.is_ok());
+    }
+    nestor.close().await.unwrap();
+    kept
+}
+
+fn stored(objects: &[&str]) -> Arc<MemoryOrigin> {
+    let origin = Arc::new(MemoryOrigin::new());
+    for object in objects {
+        origin.put(*object, pattern(OBJECT as usize));
+    }
+    origin
+}
+
+#[tokio::test]
+async fn disk_holds_the_blocks_its_admission_allows() {
+    for (admission, once_kept) in [
+        (DiskAdmission::Fetched, true),
+        (DiskAdmission::Evicted, true),
+        (DiskAdmission::Reused, false),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = stored(&["once", "twice"]);
+        let (nestor, id) = hybrid(
+            disk(dir.path(), admission),
+            namespace(origin, Consistency::Immutable),
+        )
+        .await;
+
+        nestor.read(id, "once", 0..OBJECT).await.unwrap();
+        nestor.read(id, "twice", 0..OBJECT).await.unwrap();
+        nestor.read(id, "twice", 0..OBJECT).await.unwrap();
+        nestor.close().await.unwrap();
+
+        let kept = kept_on_disk(disk(dir.path(), admission), &["once", "twice"]).await;
+        assert_eq!(kept, [once_kept, true], "{admission:?}");
+    }
+}
+
+#[tokio::test]
+async fn reused_admission_keeps_a_scan_off_the_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = stored(&["hot"]);
+    origin.put("scan", pattern(32 * BLOCK as usize));
+    let nestor = Nestor::builder(
+        CacheConfig::memory(8 * BLOCK as usize).disk(disk(dir.path(), DiskAdmission::Reused)),
+    )
+    .namespace(namespace(origin, Consistency::Immutable))
+    .build()
+    .await
+    .unwrap();
+    let id = nestor.namespace("test").unwrap();
+
+    nestor.read(id, "hot", 0..OBJECT).await.unwrap();
+    nestor.read(id, "hot", 0..OBJECT).await.unwrap();
+    nestor.read(id, "scan", 0..32 * BLOCK).await.unwrap();
+    nestor.close().await.unwrap();
+
+    let kept = kept_on_disk(disk(dir.path(), DiskAdmission::Reused), &["hot", "scan"]).await;
+    assert_eq!(kept, [true, false]);
+}
+
+#[tokio::test]
+async fn readahead_is_not_a_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = stored(&["obj"]);
+    let ns = namespace(origin, Consistency::Immutable).readahead(4);
+    let (nestor, id) = hybrid(disk(dir.path(), DiskAdmission::Reused), ns).await;
+
+    for index in 0..OBJECT / BLOCK {
+        let start = index * BLOCK;
+        nestor.read(id, "obj", start..start + BLOCK).await.unwrap();
+    }
+    nestor.close().await.unwrap();
+
+    let kept = kept_on_disk(disk(dir.path(), DiskAdmission::Reused), &["obj"]).await;
+    assert_eq!(kept, [false]);
+}
+
+#[tokio::test]
+async fn a_read_that_learns_the_size_counts_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = stored(&["obj"]);
+    let (nestor, id) = hybrid(
+        disk(dir.path(), DiskAdmission::Reused),
+        namespace(origin, Consistency::Immutable),
+    )
+    .await;
+
+    let stream = nestor.get(id, "obj", ReadRange::Full).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    stream.collect().await.unwrap();
+    nestor.close().await.unwrap();
+
+    let kept = kept_on_disk(disk(dir.path(), DiskAdmission::Reused), &["obj"]).await;
+    assert_eq!(kept, [false]);
+}
+
+#[tokio::test]
+async fn readers_that_wait_on_a_fetch_count_as_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = stored(&["obj"]);
+    origin.set_latency(Duration::from_millis(50));
+    let (nestor, id) = hybrid(
+        disk(dir.path(), DiskAdmission::Reused),
+        namespace(origin.clone(), Consistency::Immutable),
+    )
+    .await;
+
+    let (first, second) = tokio::join!(
+        nestor.read(id, "obj", 0..OBJECT),
+        nestor.read(id, "obj", 0..OBJECT)
+    );
+    first.unwrap();
+    second.unwrap();
+    assert_eq!(origin.gets(), 1);
+    nestor.close().await.unwrap();
+
+    let kept = kept_on_disk(disk(dir.path(), DiskAdmission::Reused), &["obj"]).await;
+    assert_eq!(kept, [true]);
+}
+
+#[tokio::test]
+async fn invalidate_forgets_the_reads_of_a_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = stored(&["obj"]);
+    let (nestor, id) = hybrid(
+        disk(dir.path(), DiskAdmission::Reused),
+        namespace(origin, Consistency::Immutable),
+    )
+    .await;
+
+    nestor.read(id, "obj", 0..OBJECT).await.unwrap();
+    nestor.invalidate(id, "obj").unwrap();
+    nestor.read(id, "obj", 0..OBJECT).await.unwrap();
+    nestor.close().await.unwrap();
+
+    let kept = kept_on_disk(disk(dir.path(), DiskAdmission::Reused), &["obj"]).await;
+    assert_eq!(kept, [false]);
+}
+
+#[tokio::test]
+async fn inserted_blocks_need_two_reads_to_reach_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = pattern(OBJECT as usize);
+    let (nestor, id) = hybrid(
+        disk(dir.path(), DiskAdmission::Reused),
+        namespace(Arc::new(MemoryOrigin::new()), Consistency::Immutable),
+    )
+    .await;
+
+    nestor.insert(id, "once", None, &data).unwrap();
+    nestor.insert(id, "twice", None, &data).unwrap();
+    nestor.read(id, "once", 0..OBJECT).await.unwrap();
+    nestor.read(id, "twice", 0..OBJECT).await.unwrap();
+    nestor.read(id, "twice", 0..OBJECT).await.unwrap();
+    nestor.close().await.unwrap();
+
+    let kept = kept_on_disk(disk(dir.path(), DiskAdmission::Reused), &["once", "twice"]).await;
+    assert_eq!(kept, [false, true]);
+}
+
+#[tokio::test]
+async fn an_invalidated_object_stays_gone_after_a_restart() {
+    for admission in [DiskAdmission::Fetched, DiskAdmission::Reused] {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = stored(&["obj"]);
+        let (nestor, id) = hybrid(
+            disk(dir.path(), admission),
+            namespace(origin, Consistency::Immutable),
+        )
+        .await;
+
+        nestor.read(id, "obj", 0..OBJECT).await.unwrap();
+        nestor.read(id, "obj", 0..OBJECT).await.unwrap();
+        nestor.invalidate(id, "obj").unwrap();
+        nestor.close().await.unwrap();
+
+        let kept = kept_on_disk(disk(dir.path(), admission), &["obj"]).await;
+        assert_eq!(kept, [false], "{admission:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_restart_serves_a_whole_object_read_from_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = stored(&["obj"]);
+    let (nestor, id) = hybrid(
+        disk(dir.path(), DiskAdmission::Fetched),
+        namespace(origin, Consistency::Immutable),
+    )
+    .await;
+    let data = nestor.read(id, "obj", 0..OBJECT).await.unwrap();
+    nestor.close().await.unwrap();
+
+    let offline = Arc::new(MemoryOrigin::new());
+    offline.fail_next(usize::MAX);
+    let (nestor, id) = hybrid(
+        disk(dir.path(), DiskAdmission::Fetched),
+        namespace(offline.clone(), Consistency::Immutable),
+    )
+    .await;
+
+    let whole = nestor.get(id, "obj", ReadRange::Full).await.unwrap();
+    assert_eq!(whole.collect().await.unwrap(), data);
+    let suffix = nestor.get(id, "obj", ReadRange::Suffix(10)).await.unwrap();
+    assert_eq!(
+        suffix.collect().await.unwrap(),
+        data.slice(data.len() - 10..)
+    );
+    assert_eq!(offline.gets() + offline.heads(), 0);
+    nestor.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_block_written_at_its_second_read_stays_in_ram() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = stored(&["obj"]);
+    let (nestor, id) = hybrid(
+        disk(dir.path(), DiskAdmission::Reused),
+        namespace(origin.clone(), Consistency::Immutable),
+    )
+    .await;
+
+    nestor.read(id, "obj", 0..OBJECT).await.unwrap();
+    let once = nestor.snapshot().cache.memory_used;
+    nestor.read(id, "obj", 0..OBJECT).await.unwrap();
+
+    assert!(once > 0);
+    assert_eq!(nestor.snapshot().cache.memory_used, once);
+    nestor.close().await.unwrap();
+
+    let kept = kept_on_disk(disk(dir.path(), DiskAdmission::Reused), &["obj"]).await;
+    assert_eq!(kept, [true]);
 }
