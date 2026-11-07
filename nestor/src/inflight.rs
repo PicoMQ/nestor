@@ -11,22 +11,22 @@ use tokio::sync::watch;
 use crate::error::NestorError;
 use crate::key::{Block, BlockKey};
 
-pub(crate) type BlockResult = Result<Block, Arc<NestorError>>;
-
-type Receiver = watch::Receiver<Option<BlockResult>>;
+type Outcome<T> = Result<T, Arc<NestorError>>;
+type Receiver<T> = watch::Receiver<Option<Outcome<T>>>;
+type Shard<K, T> = Mutex<HashMap<K, Receiver<T>, ahash::RandomState>>;
 
 #[derive(Clone)]
-pub(crate) struct SlotHandle {
-    rx: Receiver,
+pub(crate) struct SlotHandle<T = Block> {
+    rx: Receiver<T>,
 }
 
-impl SlotHandle {
-    pub fn resolved(result: BlockResult) -> Self {
+impl<T: Clone> SlotHandle<T> {
+    pub fn resolved(result: Outcome<T>) -> Self {
         let (_tx, rx) = watch::channel(Some(result));
         Self { rx }
     }
 
-    pub async fn wait(mut self) -> BlockResult {
+    pub async fn wait(mut self) -> Outcome<T> {
         loop {
             if let Some(result) = self.rx.borrow_and_update().as_ref() {
                 return result.clone();
@@ -38,23 +38,23 @@ impl SlotHandle {
     }
 }
 
-pub(crate) struct Slot {
-    key: BlockKey,
-    tx: watch::Sender<Option<BlockResult>>,
-    map: Arc<Inflight>,
+pub(crate) struct Slot<K: Hash + Eq = BlockKey, T = Block> {
+    key: K,
+    tx: watch::Sender<Option<Outcome<T>>>,
+    map: Arc<Inflight<K, T>>,
     resolved: bool,
 }
 
-impl Slot {
-    pub fn key(&self) -> &BlockKey {
+impl<K: Hash + Eq, T> Slot<K, T> {
+    pub fn key(&self) -> &K {
         &self.key
     }
 
-    pub fn resolve(mut self, result: BlockResult) {
+    pub fn resolve(mut self, result: Outcome<T>) {
         self.settle(result);
     }
 
-    fn settle(&mut self, result: BlockResult) {
+    fn settle(&mut self, result: Outcome<T>) {
         if self.resolved {
             return;
         }
@@ -64,23 +64,23 @@ impl Slot {
     }
 }
 
-impl Drop for Slot {
+impl<K: Hash + Eq, T> Drop for Slot<K, T> {
     fn drop(&mut self) {
         self.settle(Err(Arc::new(NestorError::Cancelled)));
     }
 }
 
-pub(crate) enum Registration {
-    Owner(Slot, SlotHandle),
-    Waiter(SlotHandle),
+pub(crate) enum Registration<K: Hash + Eq = BlockKey, T = Block> {
+    Owner(Slot<K, T>, SlotHandle<T>),
+    Waiter(SlotHandle<T>),
 }
 
-pub(crate) struct Inflight {
-    shards: Box<[Mutex<HashMap<BlockKey, Receiver, ahash::RandomState>>]>,
+pub(crate) struct Inflight<K: Hash + Eq = BlockKey, T = Block> {
+    shards: Box<[Shard<K, T>]>,
     hasher: ahash::RandomState,
 }
 
-impl Inflight {
+impl<K: Hash + Eq, T> Inflight<K, T> {
     pub fn new(shards: usize) -> Arc<Self> {
         let shards = shards.max(1).next_power_of_two();
         Arc::new(Self {
@@ -91,14 +91,30 @@ impl Inflight {
         })
     }
 
-    fn shard(&self, key: &BlockKey) -> &Mutex<HashMap<BlockKey, Receiver, ahash::RandomState>> {
+    fn shard(&self, key: &K) -> &Shard<K, T> {
         let mut h = self.hasher.build_hasher();
         key.hash(&mut h);
         let idx = (std::hash::Hasher::finish(&h) as usize) & (self.shards.len() - 1);
         &self.shards[idx]
     }
 
-    pub fn register(self: &Arc<Self>, key: BlockKey) -> Registration {
+    fn remove(&self, key: &K) {
+        self.shard(key)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
+    }
+
+    pub fn len(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).len())
+            .sum()
+    }
+}
+
+impl<K: Hash + Eq + Clone, T> Inflight<K, T> {
+    pub fn register(self: &Arc<Self>, key: K) -> Registration<K, T> {
         let mut shard = self.shard(&key).lock().unwrap_or_else(|e| e.into_inner());
         if let Some(rx) = shard.get(&key) {
             return Registration::Waiter(SlotHandle { rx: rx.clone() });
@@ -112,20 +128,6 @@ impl Inflight {
             resolved: false,
         };
         Registration::Owner(slot, SlotHandle { rx })
-    }
-
-    fn remove(&self, key: &BlockKey) {
-        self.shard(key)
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(key);
-    }
-
-    pub fn len(&self) -> usize {
-        self.shards
-            .iter()
-            .map(|s| s.lock().unwrap_or_else(|e| e.into_inner()).len())
-            .sum()
     }
 }
 
@@ -155,7 +157,7 @@ mod tests {
 
     #[tokio::test]
     async fn owner_resolves_waiters() {
-        let inflight = Inflight::new(4);
+        let inflight: Arc<Inflight> = Inflight::new(4);
         let Registration::Owner(slot, own) = inflight.register(key(1)) else {
             panic!("expected owner");
         };
@@ -175,7 +177,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropped_owner_cancels_waiters() {
-        let inflight = Inflight::new(4);
+        let inflight: Arc<Inflight> = Inflight::new(4);
         let Registration::Owner(slot, _) = inflight.register(key(2)) else {
             panic!("expected owner");
         };
