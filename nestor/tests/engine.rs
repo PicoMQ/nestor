@@ -255,6 +255,36 @@ async fn concurrent_readers_share_one_origin_fetch() {
 }
 
 #[tokio::test]
+async fn concurrent_reads_of_an_unknown_size_share_one_probe() {
+    for consistency in [
+        Consistency::Immutable,
+        Consistency::Etag {
+            ttl: Duration::from_secs(60),
+        },
+    ] {
+        let origin = Arc::new(MemoryOrigin::new());
+        origin.set_latency(Duration::from_millis(20));
+        let data = pattern(3 * BLOCK as usize + 5);
+        origin.put("obj", data.clone());
+        let (nestor, id) = engine(namespace(origin.clone(), consistency)).await;
+
+        let reads: Vec<_> = (0..8)
+            .map(|_| {
+                let nestor = nestor.clone();
+                tokio::spawn(async move {
+                    let read = nestor.get(id, "obj", ReadRange::Full).await.unwrap();
+                    read.collect().await.unwrap()
+                })
+            })
+            .collect();
+        for read in reads {
+            assert_eq!(read.await.unwrap(), data);
+        }
+        assert_eq!(origin.gets(), 1, "{consistency:?}");
+    }
+}
+
+#[tokio::test]
 async fn transient_origin_failures_are_retried() {
     let origin = Arc::new(MemoryOrigin::new());
     let data = pattern(2 * BLOCK as usize);
