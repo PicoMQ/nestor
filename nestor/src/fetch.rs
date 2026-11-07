@@ -223,17 +223,20 @@ impl Fetcher {
         let slot = match self.probes.register(key.clone()) {
             Registration::Owner(slot, _) => slot,
             Registration::Waiter(probe) => {
-                ns.metrics.joined.increment(1);
                 if let Ok(meta) = probe.wait().await {
                     let ctx =
                         ReadCtx::new(Arc::clone(ns), key, Arc::clone(name), Some(meta), policy);
                     return Ok((ctx, Vec::new()));
                 }
-                return self.probe_origin(ns, name, indexes, stale, policy).await;
+                return self
+                    .probe_origin(ns, name, key, indexes, stale, policy)
+                    .await;
             }
         };
 
-        let probed = self.probe_origin(ns, name, indexes, stale, policy).await;
+        let probed = self
+            .probe_origin(ns, name, key, indexes, stale, policy)
+            .await;
         if let Ok((ctx, _)) = &probed
             && let Some(meta) = &ctx.meta
         {
@@ -246,11 +249,11 @@ impl Fetcher {
         self: &Arc<Self>,
         ns: &Arc<NamespaceState>,
         name: &Arc<str>,
+        key: ObjectKey,
         indexes: Range<u32>,
         stale: Option<ObjectMeta>,
         policy: FetchPolicy,
     ) -> Result<(Arc<ReadCtx>, Vec<SlotHandle>), NestorError> {
-        let key = ObjectKey::new(ns.id, name);
         let ctx = ReadCtx::new(Arc::clone(ns), key.clone(), Arc::clone(name), None, policy);
         let bs = ns.config.block_size;
         let options = GetOptions {
